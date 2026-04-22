@@ -1,0 +1,8 @@
+crashrepro
+*.o
+*.obj
+build/
+.zig-cache/
+zig-cache/
+zig-out/
+.DS_Store
