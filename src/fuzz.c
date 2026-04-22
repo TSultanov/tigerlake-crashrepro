@@ -581,12 +581,14 @@ int fuzz_run(const fuzz_cfg_t *cfg) {
 			uint64_t now = now_ns();
 			double elapsed = (double)(now - last_ns) / 1e9;
 			double rate = (double)report_every / elapsed;
+			const char *last_churn = pwr.bursts == 0 ? "none" : power_profile_name(pwr.last_profile);
 			fprintf(stderr,
-				"t%u iter=%llu rate=%.0f/s mismatches=%llu churn_bursts=%llu expected_faults=%llu missed_faults=%llu\n",
+				"t%u iter=%llu rate=%.0f/s mismatches=%llu churn_bursts=%llu last_churn=%s expected_faults=%llu missed_faults=%llu\n",
 				cfg->thread_id, (unsigned long long)iter,
 				rate,
 				(unsigned long long)mismatches,
 				(unsigned long long)pwr.bursts,
+				last_churn,
 				(unsigned long long)expected_faults,
 				(unsigned long long)missed_faults);
 			last_ns = now;

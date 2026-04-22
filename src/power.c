@@ -215,6 +215,7 @@ void power_churn_cycle(prng_t *p, const power_plan_t *plan, power_stats_t *st) {
 	if (st) {
 		st->bursts++;
 		st->total_burst_ns += (now_ns() - start);
+		st->last_profile = use_plan->profile;
 	}
 	(void)iters;
 }

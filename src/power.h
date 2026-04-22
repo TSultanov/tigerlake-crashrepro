@@ -65,6 +65,7 @@ typedef struct {
 typedef struct {
 	uint64_t bursts;
 	uint64_t total_burst_ns;
+	power_profile_t last_profile;
 } power_stats_t;
 
 /* Run one burst-then-gap cycle with randomised parameters.
