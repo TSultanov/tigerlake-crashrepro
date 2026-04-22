@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 
+#include "power.h"
+
 /* How a/b/dst relate in one iteration. Stored in the durable log so replay
  * can tell whether an iteration used distinct buffers, exact aliasing, or a
  * partial overlap intended to stress read-before-write and forwarding paths. */
@@ -57,6 +59,7 @@ typedef struct {
 	uint32_t    shape_mask;    /* bit i set => operand shape i enabled; 0 => all */
 	share_dst_mode_t share_dst_mode;
 	int         interrupt_pressure;
+	power_cfg_t power;
 	int         verify;        /* scalar oracle compare on/off */
 	int         churn;         /* frequency/power churn on/off */
 	int         faults;        /* intentional AVX-512 bad-address faults on/off */

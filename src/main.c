@@ -29,6 +29,11 @@ static void usage(const char *prog) {
 		"  --shapes=<csv>        restrict to these operand shapes; default: all\n"
 		"  --share-dst=<mode>    dst ownership mode: off|on|alternate (default: alternate)\n"
 		"  --interrupts=<on|off> inject asynchronous signal pressure into workers (default: on)\n"
+		"  --churn-profile=<p>   power transition profile: random|passive|scalar|avx2|train\n"
+		"  --churn-burst-us=<r>  AVX-512 burst range in microseconds: min:max or fixed\n"
+		"  --churn-gap-us=<r>    gap range in microseconds: min:max or fixed\n"
+		"  --churn-reentry-us=<r> re-entry burst range in microseconds: min:max or fixed\n"
+		"  --list-churn-profiles print available churn profiles and exit\n"
 		"  --verify=<on|off>     scalar oracle compare (default: on)\n"
 		"  --churn=<on|off>      AVX-512 frequency/power churn (default: on)\n"
 		"  --faults=<on|off>     AVX-512 loads/stores at intentionally bad\n"
@@ -76,6 +81,47 @@ static share_dst_mode_t parse_share_dst_mode(const char *v) {
 	}
 	fprintf(stderr, "bad share-dst mode: %s\n", v);
 	exit(2);
+}
+
+static power_profile_t parse_power_profile(const char *v) {
+	if (!v || !*v || !strcmp(v, "random")) return POWER_PROFILE_RANDOM;
+	if (!strcmp(v, "passive") || !strcmp(v, "sleep")) return POWER_PROFILE_PASSIVE;
+	if (!strcmp(v, "scalar")) return POWER_PROFILE_SCALAR;
+	if (!strcmp(v, "avx2")) return POWER_PROFILE_AVX2;
+	if (!strcmp(v, "train") || !strcmp(v, "reentry")) return POWER_PROFILE_TRAIN;
+	fprintf(stderr, "bad churn profile: %s\n", v);
+	exit(2);
+}
+
+static void parse_u32_range(const char *v, uint32_t *min_out, uint32_t *max_out) {
+	char *end = NULL;
+	unsigned long lo;
+	unsigned long hi;
+	if (!v || !*v) {
+		fprintf(stderr, "empty numeric range\n");
+		exit(2);
+	}
+	lo = strtoul(v, &end, 0);
+	if (end == v || lo > 0xfffffffful) {
+		fprintf(stderr, "bad numeric range: %s\n", v);
+		exit(2);
+	}
+	if (*end == '\0') {
+		*min_out = (uint32_t)lo;
+		*max_out = (uint32_t)lo;
+		return;
+	}
+	if (*end != ':') {
+		fprintf(stderr, "bad numeric range: %s\n", v);
+		exit(2);
+	}
+	hi = strtoul(end + 1, &end, 0);
+	if (*end != '\0' || hi > 0xfffffffful || hi < lo) {
+		fprintf(stderr, "bad numeric range: %s\n", v);
+		exit(2);
+	}
+	*min_out = (uint32_t)lo;
+	*max_out = (uint32_t)hi;
 }
 
 static uint64_t parse_classes(const char *csv) {
@@ -141,6 +187,12 @@ static void list_classes(void) {
 static void list_shapes(void) {
 	for (uint32_t i = 0; i < OPERAND_SHAPE_COUNT; i++) {
 		printf("  %s\n", operand_shape_name(i));
+	}
+}
+
+static void list_churn_profiles(void) {
+	for (uint32_t i = 0; i < POWER_PROFILE_COUNT; i++) {
+		printf("  %s\n", power_profile_name((power_profile_t)i));
 	}
 }
 
@@ -231,6 +283,7 @@ int main(int argc, char **argv) {
 	uint32_t shape_mask = 0;
 	share_dst_mode_t share_dst_mode = SHARE_DST_ALTERNATE;
 	int interrupt_pressure = 1;
+	power_cfg_t power = power_cfg_default();
 	int verify = 1;
 	int churn = 1;
 	int faults = 1;
@@ -245,6 +298,8 @@ int main(int argc, char **argv) {
 			list_classes(); return 0;
 		} else if (!strcmp(argv[i], "--list-shapes")) {
 			list_shapes(); return 0;
+		} else if (!strcmp(argv[i], "--list-churn-profiles")) {
+			list_churn_profiles(); return 0;
 		} else if (!strncmp(argv[i], "--seed=", 7)) {
 			seed = strtoull(argv[i] + 7, NULL, 0); have_seed = 1;
 		} else if (!strncmp(argv[i], "--threads=", 10)) {
@@ -259,6 +314,14 @@ int main(int argc, char **argv) {
 			share_dst_mode = parse_share_dst_mode(argv[i] + 12);
 		} else if (!strncmp(argv[i], "--interrupts=", 13)) {
 			interrupt_pressure = parse_on_off(argv[i] + 13, 0);
+		} else if (!strncmp(argv[i], "--churn-profile=", 16)) {
+			power.profile = parse_power_profile(argv[i] + 16);
+		} else if (!strncmp(argv[i], "--churn-burst-us=", 17)) {
+			parse_u32_range(argv[i] + 17, &power.burst_min_us, &power.burst_max_us);
+		} else if (!strncmp(argv[i], "--churn-gap-us=", 15)) {
+			parse_u32_range(argv[i] + 15, &power.gap_min_us, &power.gap_max_us);
+		} else if (!strncmp(argv[i], "--churn-reentry-us=", 19)) {
+			parse_u32_range(argv[i] + 19, &power.reentry_min_us, &power.reentry_max_us);
 		} else if (!strncmp(argv[i], "--verify=", 9)) {
 			verify = parse_on_off(argv[i] + 9, 1);
 		} else if (!strncmp(argv[i], "--churn=", 8)) {
@@ -301,9 +364,13 @@ int main(int argc, char **argv) {
 			"the target crash.\n");
 	}
 
-	printf("seed=0x%016llx threads=%d iters=%llu verify=%s churn=%s faults=%s share_dst=%s interrupts=%s pin=%d logdir=%s\n",
+	printf("seed=0x%016llx threads=%d iters=%llu verify=%s churn=%s churn_profile=%s burst_us=%u:%u gap_us=%u:%u reentry_us=%u:%u faults=%s share_dst=%s interrupts=%s pin=%d logdir=%s\n",
 	       (unsigned long long)seed, threads, (unsigned long long)iters,
 	       verify ? "on" : "off", churn ? "on" : "off",
+	       power_profile_name(power.profile),
+	       power.burst_min_us, power.burst_max_us,
+	       power.gap_min_us, power.gap_max_us,
+	       power.reentry_min_us, power.reentry_max_us,
 	       faults ? "on" : "off", share_dst_mode_name(share_dst_mode),
 	       interrupt_pressure ? "on" : "off", pin, logdir);
 
@@ -347,6 +414,7 @@ int main(int argc, char **argv) {
 		ws[i].cfg.shape_mask = shape_mask;
 		ws[i].cfg.share_dst_mode = share_dst_mode;
 		ws[i].cfg.interrupt_pressure = interrupt_pressure;
+		ws[i].cfg.power      = power;
 		ws[i].cfg.verify     = verify;
 		ws[i].cfg.churn      = churn;
 		ws[i].cfg.faults     = faults;

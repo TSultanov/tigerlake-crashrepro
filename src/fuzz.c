@@ -563,7 +563,7 @@ int fuzz_run(const fuzz_cfg_t *cfg) {
 		 * lets the core clock back up. Tiger Lake's suspected crash sits
 		 * right on this transition, so this is a primary provocation. */
 		if (cfg->churn && (prng_u32(&p) & 0xFFu) == 0) {
-			power_churn_cycle(&p, &pwr);
+			power_churn_cycle(&p, &cfg->power, &pwr);
 		}
 
 		if (!cfg->quiet && iter == next_report) {

@@ -46,6 +46,11 @@ Common runs:
 # Add asynchronous signal pressure on top of the default fuzz loop:
 ./crashrepro --logdir=/var/tmp/cr --interrupts=on
 
+# Force one transition profile and narrow the timing windows for replay:
+./crashrepro --logdir=/var/tmp/cr --churn-profile=avx2 \
+             --churn-burst-us=300:500 --churn-gap-us=20:40 \
+             --churn-reentry-us=10:25
+
 # Deterministic replay of one class using a seed we saw crash before:
 ./crashrepro --seed=0xDEADBEEFCAFEBABE --threads=1 \
              --classes=vmovdqu64 --churn=off --iters=1000000
@@ -78,6 +83,14 @@ Flags of note:
 - `--interrupts=<on|off>` — send benign asynchronous signals to worker
    threads while they fuzz, forcing extra kernel save/restore pressure
    around AVX-512 execution (default: on).
+- `--churn-profile=<p>` — force one power-transition profile: `random`
+   (default), `passive`, `scalar`, `avx2`, or `train`.
+- `--churn-burst-us=<r>` — set the AVX-512 burst length range in
+   microseconds as `min:max`, or a fixed value.
+- `--churn-gap-us=<r>` — set the gap length range in microseconds as
+   `min:max`, or a fixed value.
+- `--churn-reentry-us=<r>` — set the short re-entry burst range in
+   microseconds as `min:max`, or a fixed value.
 - `--verify=on|off` — compare against a scalar oracle (default: on).
 - `--churn=on|off` — interleave AVX-512 frequency/voltage bursts
    using a mix of throughput-heavy, dependency-heavy, and memory-heavy
