@@ -155,6 +155,7 @@ static void dump_ring(int fd, const logger_t *lg) {
 		safe_str(fd, " shape="); safe_u64(fd, e->operand_shape);
 		safe_str(fd, "("); safe_str(fd, operand_shape_name(e->operand_shape)); safe_str(fd, ")");
 		safe_str(fd, " dst="); safe_str(fd, (e->flags & LOG_FLAG_SHARED_DST) ? "shared" : "private");
+		safe_str(fd, " irq="); safe_str(fd, (e->flags & LOG_FLAG_INTERRUPT_PRESSURE) ? "on" : "off");
 		safe_str(fd, " kreg="); safe_u64(fd, LOG_DECODE_KREG(e->flags));
 		safe_str(fd, " mask="); safe_hex64(fd, e->mask_pattern);
 		safe_str(fd, " off="); safe_u64(fd, e->alignment_offset);

@@ -14,6 +14,10 @@
 #include "logger.h"
 #include "sighandler.h"
 
+#define INTERRUPT_SIGNAL SIGUSR1
+#define INTERRUPT_MIN_US 50u
+#define INTERRUPT_MAX_US 250u
+
 static void usage(const char *prog) {
 	fprintf(stderr,
 		"usage: %s [flags]\n"
@@ -24,6 +28,7 @@ static void usage(const char *prog) {
 		"  --classes=<csv>       restrict to these insn names; default: all\n"
 		"  --shapes=<csv>        restrict to these operand shapes; default: all\n"
 		"  --share-dst=<mode>    dst ownership mode: off|on|alternate (default: alternate)\n"
+		"  --interrupts=<on|off> inject asynchronous signal pressure into workers (default: on)\n"
 		"  --verify=<on|off>     scalar oracle compare (default: on)\n"
 		"  --churn=<on|off>      AVX-512 frequency/power churn (default: on)\n"
 		"  --faults=<on|off>     AVX-512 loads/stores at intentionally bad\n"
@@ -142,8 +147,67 @@ static void list_shapes(void) {
 typedef struct {
 	fuzz_cfg_t cfg;
 	pthread_t  th;
+	int        started;
 	int        rc;
 } worker_t;
+
+typedef struct {
+	worker_t   *workers;
+	uint32_t    worker_count;
+	uint64_t    seed;
+	_Atomic int stop;
+	pthread_t   th;
+} interrupt_pressure_t;
+
+static void interrupt_pressure_handler(int sig) {
+	(void)sig;
+}
+
+static int install_interrupt_pressure_handler(void) {
+	struct sigaction sa;
+	memset(&sa, 0, sizeof sa);
+	sa.sa_handler = interrupt_pressure_handler;
+	sa.sa_flags = SA_RESTART | SA_ONSTACK;
+	sigemptyset(&sa.sa_mask);
+	return sigaction(INTERRUPT_SIGNAL, &sa, NULL);
+}
+
+static uint64_t interrupt_rng_next(uint64_t *state) {
+	uint64_t x = *state ? *state : 0x9E3779B97F4A7C15ull;
+	x ^= x >> 12;
+	x ^= x << 25;
+	x ^= x >> 27;
+	*state = x;
+	return x * 2685821657736338717ull;
+}
+
+static void *interrupt_pressure_entry(void *arg) {
+	interrupt_pressure_t *pressure = arg;
+	uint64_t state = pressure->seed ? pressure->seed : 1u;
+
+	while (!atomic_load_explicit(&pressure->stop, memory_order_relaxed) &&
+	       !fuzz_should_stop()) {
+		int sent = 0;
+		uint32_t start = (uint32_t)(interrupt_rng_next(&state) % pressure->worker_count);
+		for (uint32_t offset = 0; offset < pressure->worker_count; offset++) {
+			worker_t *worker = &pressure->workers[(start + offset) % pressure->worker_count];
+			if (!worker->started) continue;
+			(void)pthread_kill(worker->th, INTERRUPT_SIGNAL);
+			sent = 1;
+			break;
+		}
+		if (!sent) break;
+		if ((interrupt_rng_next(&state) & 3u) == 0) {
+			for (uint32_t i = 0; i < pressure->worker_count; i++) {
+				if (!pressure->workers[i].started) continue;
+				(void)pthread_kill(pressure->workers[i].th, INTERRUPT_SIGNAL);
+			}
+		}
+		usleep((useconds_t)(INTERRUPT_MIN_US +
+		       (interrupt_rng_next(&state) % (INTERRUPT_MAX_US - INTERRUPT_MIN_US + 1u))));
+	}
+	return NULL;
+}
 
 static void *worker_entry(void *arg) {
 	worker_t *w = arg;
@@ -166,6 +230,7 @@ int main(int argc, char **argv) {
 	uint64_t class_mask = 0;
 	uint32_t shape_mask = 0;
 	share_dst_mode_t share_dst_mode = SHARE_DST_ALTERNATE;
+	int interrupt_pressure = 1;
 	int verify = 1;
 	int churn = 1;
 	int faults = 1;
@@ -192,6 +257,8 @@ int main(int argc, char **argv) {
 			shape_mask = parse_shapes(argv[i] + 9);
 		} else if (!strncmp(argv[i], "--share-dst=", 12)) {
 			share_dst_mode = parse_share_dst_mode(argv[i] + 12);
+		} else if (!strncmp(argv[i], "--interrupts=", 13)) {
+			interrupt_pressure = parse_on_off(argv[i] + 13, 0);
 		} else if (!strncmp(argv[i], "--verify=", 9)) {
 			verify = parse_on_off(argv[i] + 9, 1);
 		} else if (!strncmp(argv[i], "--churn=", 8)) {
@@ -234,13 +301,19 @@ int main(int argc, char **argv) {
 			"the target crash.\n");
 	}
 
-	printf("seed=0x%016llx threads=%d iters=%llu verify=%s churn=%s faults=%s share_dst=%s pin=%d logdir=%s\n",
+	printf("seed=0x%016llx threads=%d iters=%llu verify=%s churn=%s faults=%s share_dst=%s interrupts=%s pin=%d logdir=%s\n",
 	       (unsigned long long)seed, threads, (unsigned long long)iters,
 	       verify ? "on" : "off", churn ? "on" : "off",
-	       faults ? "on" : "off", share_dst_mode_name(share_dst_mode), pin, logdir);
+	       faults ? "on" : "off", share_dst_mode_name(share_dst_mode),
+	       interrupt_pressure ? "on" : "off", pin, logdir);
 
 	if (sighandler_install_global(logdir) < 0) {
 		fprintf(stderr, "error: cannot install crash handlers: %s\n",
+		        strerror(errno));
+		return 1;
+	}
+	if (interrupt_pressure && install_interrupt_pressure_handler() < 0) {
+		fprintf(stderr, "error: cannot install interrupt-pressure handler: %s\n",
 		        strerror(errno));
 		return 1;
 	}
@@ -257,6 +330,12 @@ int main(int argc, char **argv) {
 
 	worker_t *ws = calloc((size_t)threads, sizeof *ws);
 	if (!ws) { fprintf(stderr, "oom\n"); return 1; }
+	interrupt_pressure_t pressure;
+	int pressure_started = 0;
+	memset(&pressure, 0, sizeof pressure);
+	pressure.workers = ws;
+	pressure.worker_count = (uint32_t)threads;
+	pressure.seed = seed ^ 0xA0761D6478BD642Full;
 
 	for (int i = 0; i < threads; i++) {
 		ws[i].cfg.thread_id  = (uint32_t)i;
@@ -267,6 +346,7 @@ int main(int argc, char **argv) {
 		ws[i].cfg.class_mask = class_mask;
 		ws[i].cfg.shape_mask = shape_mask;
 		ws[i].cfg.share_dst_mode = share_dst_mode;
+		ws[i].cfg.interrupt_pressure = interrupt_pressure;
 		ws[i].cfg.verify     = verify;
 		ws[i].cfg.churn      = churn;
 		ws[i].cfg.faults     = faults;
@@ -276,13 +356,27 @@ int main(int argc, char **argv) {
 		if (pthread_create(&ws[i].th, NULL, worker_entry, &ws[i]) != 0) {
 			fprintf(stderr, "pthread_create thread %d failed\n", i);
 			fuzz_request_stop();
+		} else {
+			ws[i].started = 1;
+		}
+	}
+	if (interrupt_pressure) {
+		if (pthread_create(&pressure.th, NULL, interrupt_pressure_entry, &pressure) != 0) {
+			fprintf(stderr, "warning: interrupt pressure disabled: pthread_create failed\n");
+		} else {
+			pressure_started = 1;
 		}
 	}
 
 	int any_mismatch = 0;
 	for (int i = 0; i < threads; i++) {
+		if (!ws[i].started) continue;
 		pthread_join(ws[i].th, NULL);
 		if (ws[i].rc) any_mismatch = 1;
+	}
+	if (pressure_started) {
+		atomic_store_explicit(&pressure.stop, 1, memory_order_relaxed);
+		pthread_join(pressure.th, NULL);
 	}
 
 	printf("all threads joined; mismatch=%d\n", any_mismatch);

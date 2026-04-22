@@ -56,6 +56,7 @@ typedef struct {
 	uint64_t    class_mask;    /* bit i set => class i enabled; 0 => all */
 	uint32_t    shape_mask;    /* bit i set => operand shape i enabled; 0 => all */
 	share_dst_mode_t share_dst_mode;
+	int         interrupt_pressure;
 	int         verify;        /* scalar oracle compare on/off */
 	int         churn;         /* frequency/power churn on/off */
 	int         faults;        /* intentional AVX-512 bad-address faults on/off */

@@ -43,6 +43,9 @@ Common runs:
 # Force always-shared destination ownership instead of the default alternating mode:
 ./crashrepro --logdir=/var/tmp/cr --share-dst=on
 
+# Add asynchronous signal pressure on top of the default fuzz loop:
+./crashrepro --logdir=/var/tmp/cr --interrupts=on
+
 # Deterministic replay of one class using a seed we saw crash before:
 ./crashrepro --seed=0xDEADBEEFCAFEBABE --threads=1 \
              --classes=vmovdqu64 --churn=off --iters=1000000
@@ -72,6 +75,9 @@ Flags of note:
    `alternate` (default). `alternate` runs in deterministic windows of
    16384 iterations, switching between each thread's private `dst` region
    and one shared `dst` region across all workers.
+- `--interrupts=<on|off>` — send benign asynchronous signals to worker
+   threads while they fuzz, forcing extra kernel save/restore pressure
+   around AVX-512 execution (default: on).
 - `--verify=on|off` — compare against a scalar oracle (default: on).
 - `--churn=on|off` — interleave AVX-512 frequency/voltage bursts
    using a mix of throughput-heavy, dependency-heavy, and memory-heavy
@@ -105,6 +111,9 @@ For each iteration, per thread:
    burst-then-gap cycle that forces a frequency/voltage transition. The
    burst profile is varied between independent ALU pressure, dependent
    chains, and unaligned `vmovdqu64`-heavy load/store traffic.
+6. If `--interrupts=on`, a helper thread asynchronously signals workers to
+   force extra user-kernel-user context switches and AVX state save/restore
+   pressure while the same fuzz cases are executing.
 
 On SIGSEGV / SIGILL / SIGBUS / SIGFPE / SIGTRAP: an async-signal-safe
 handler writes signal info, full integer register file, the thread's

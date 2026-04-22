@@ -526,6 +526,7 @@ int fuzz_run(const fuzz_cfg_t *cfg) {
 		                   fnv1a64(v_dst_pre, 64);
 		uint32_t flags = (uint32_t)(zeromask ? LOG_FLAG_ZEROMASK : 0u) |
 		                 (uint32_t)(use_shared_dst ? LOG_FLAG_SHARED_DST : 0u) |
+		                 (uint32_t)(cfg->interrupt_pressure ? LOG_FLAG_INTERRUPT_PRESSURE : 0u) |
 		                 LOG_ENCODE_KREG(kreg);
 		log_entry_t *e = logger_begin(&lg, iter, cls, (uint32_t)layout.shape,
 		                              (uint32_t)(mask & 0xffffffffu),
