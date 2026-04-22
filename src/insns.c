@@ -11,6 +11,7 @@
 
 #include "insns.h"
 
+#include <immintrin.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -164,6 +165,46 @@ uint32_t insn_get_kreg(void) {
 	return tls_kreg;
 }
 
+static inline uint32_t bounded_dword_offset(uint32_t raw) {
+	return raw & 60u;
+}
+
+static void sanitize_gather_offsets_dword(const void *a_in, int32_t *idx_out,
+	                                      uint32_t lanes) {
+	const uint32_t *raw = (const uint32_t *)a_in;
+	for (uint32_t i = 0; i < lanes; i++) {
+		idx_out[i] = (int32_t)bounded_dword_offset(raw[i]);
+	}
+}
+
+static void sanitize_scatter_offsets_dword(const void *b_in, int32_t *idx_out,
+	                                       uint32_t lanes) {
+	const uint32_t *raw = (const uint32_t *)b_in;
+	uint32_t slots[16];
+
+	for (uint32_t i = 0; i < lanes; i++) {
+		slots[i] = i;
+	}
+	for (uint32_t i = 0; i < lanes; i++) {
+		uint32_t remain = lanes - i;
+		uint32_t pick = raw[i] % remain;
+		idx_out[i] = (int32_t)(slots[pick] * 4u);
+		slots[pick] = slots[remain - 1u];
+	}
+}
+
+static void store_ymm_zero_extended(void *dst, __m256i value) {
+	uint8_t tmp[64] __attribute__((aligned(64))) = {0};
+	_mm256_store_si256((__m256i *)(void *)tmp, value);
+	memcpy(dst, tmp, sizeof tmp);
+}
+
+static void store_xmm_zero_extended(void *dst, __m128i value) {
+	uint8_t tmp[64] __attribute__((aligned(64))) = {0};
+	_mm_store_si128((__m128i *)(void *)tmp, value);
+	memcpy(dst, tmp, sizeof tmp);
+}
+
 /* ---------- moves ---------- */
 
 static void exec_vmovdqu64(const void *a, const void *b, void *dst,
@@ -200,6 +241,16 @@ static void exec_vpaddq(const void *a, const void *b, void *dst,
 static void exec_vpaddb(const void *a, const void *b, void *dst,
                         uint64_t mask, int zeromask) {
 	DISPATCH_KREG(BODY_BINARY_MASK_Q, "vpaddb %%zmm1, %%zmm0, %%zmm2 ");
+}
+
+static void exec_vpaddd(const void *a, const void *b, void *dst,
+	                    uint64_t mask, int zeromask) {
+	DISPATCH_KREG(BODY_BINARY_MASK_Q, "vpaddd %%zmm1, %%zmm0, %%zmm2 ");
+}
+
+static void exec_vpaddw(const void *a, const void *b, void *dst,
+	                    uint64_t mask, int zeromask) {
+	DISPATCH_KREG(BODY_BINARY_MASK_Q, "vpaddw %%zmm1, %%zmm0, %%zmm2 ");
 }
 
 /* ---------- logical ---------- */
@@ -244,6 +295,94 @@ static void exec_vplzcntq(const void *a, const void *b, void *dst,
                           uint64_t mask, int zeromask) {
 	(void)b;
 	DISPATCH_KREG(BODY_UNARY_MASK_Q, "vplzcntq %%zmm0, %%zmm2 ");
+}
+
+/* ---------- masked memory-heavy EVEX families ---------- */
+
+static void exec_vpexpandd(const void *a, const void *b, void *dst,
+	                       uint64_t mask, int zeromask) {
+	__m512i merge;
+	(void)b;
+	merge = zeromask ? _mm512_setzero_si512()
+	                 : _mm512_loadu_si512((const void *)dst);
+	merge = _mm512_mask_expandloadu_epi32(merge, (__mmask16)mask, a);
+	_mm512_storeu_si512((void *)dst, merge);
+}
+
+static void exec_vpexpandd_ymm(const void *a, const void *b, void *dst,
+	                           uint64_t mask, int zeromask) {
+	__m256i merge;
+	__m256i result;
+	(void)b;
+	merge = zeromask ? _mm256_setzero_si256()
+	                 : _mm256_loadu_si256((const __m256i *)(const void *)dst);
+	result = _mm256_mask_expandloadu_epi32(merge, (__mmask8)mask, a);
+	store_ymm_zero_extended(dst, result);
+}
+
+static void exec_vpexpandd_xmm(const void *a, const void *b, void *dst,
+	                           uint64_t mask, int zeromask) {
+	__m128i merge;
+	__m128i result;
+	(void)b;
+	merge = zeromask ? _mm_setzero_si128()
+	                 : _mm_loadu_si128((const __m128i *)(const void *)dst);
+	result = _mm_mask_expandloadu_epi32(merge, (__mmask8)mask, a);
+	store_xmm_zero_extended(dst, result);
+}
+
+static void exec_vpgatherdd(const void *a, const void *b, void *dst,
+	                       uint64_t mask, int zeromask) {
+	int32_t idx[16] __attribute__((aligned(64)));
+	__m512i merge;
+	__m512i vindex;
+
+	sanitize_gather_offsets_dword(a, idx, 16u);
+	vindex = _mm512_load_si512((const void *)idx);
+	merge = zeromask ? _mm512_setzero_si512()
+	                 : _mm512_loadu_si512((const void *)dst);
+	merge = _mm512_mask_i32gather_epi32(merge, (__mmask16)mask, vindex, b, 1);
+	_mm512_storeu_si512((void *)dst, merge);
+}
+
+static void exec_vpcompressd(const void *a, const void *b, void *dst,
+	                        uint64_t mask, int zeromask) {
+	__m512i src;
+	(void)b;
+	(void)zeromask;
+	src = _mm512_loadu_si512((const void *)a);
+	_mm512_mask_compressstoreu_epi32(dst, (__mmask16)mask, src);
+}
+
+static void exec_vpcompressd_ymm(const void *a, const void *b, void *dst,
+	                            uint64_t mask, int zeromask) {
+	__m256i src;
+	(void)b;
+	(void)zeromask;
+	src = _mm256_loadu_si256((const __m256i *)(const void *)a);
+	_mm256_mask_compressstoreu_epi32(dst, (__mmask8)mask, src);
+}
+
+static void exec_vpcompressd_xmm(const void *a, const void *b, void *dst,
+	                            uint64_t mask, int zeromask) {
+	__m128i src;
+	(void)b;
+	(void)zeromask;
+	src = _mm_loadu_si128((const __m128i *)(const void *)a);
+	_mm_mask_compressstoreu_epi32(dst, (__mmask8)mask, src);
+}
+
+static void exec_vpscatterdd(const void *a, const void *b, void *dst,
+	                        uint64_t mask, int zeromask) {
+	int32_t idx[16] __attribute__((aligned(64)));
+	__m512i src;
+	__m512i vindex;
+	(void)zeromask;
+
+	sanitize_scatter_offsets_dword(b, idx, 16u);
+	vindex = _mm512_load_si512((const void *)idx);
+	src = _mm512_loadu_si512((const void *)a);
+	_mm512_mask_i32scatter_epi32(dst, (__mmask16)mask, vindex, src, 1);
 }
 
 /* ---------- intentional fault executors ----------
@@ -319,12 +458,22 @@ void oracle_vmovdqu32  (const void *a, const void *b, void *dst, uint64_t m, int
 void oracle_vmovdqu8   (const void *a, const void *b, void *dst, uint64_t m, int z);
 void oracle_vpaddq     (const void *a, const void *b, void *dst, uint64_t m, int z);
 void oracle_vpaddb     (const void *a, const void *b, void *dst, uint64_t m, int z);
+void oracle_vpaddd     (const void *a, const void *b, void *dst, uint64_t m, int z);
+void oracle_vpaddw     (const void *a, const void *b, void *dst, uint64_t m, int z);
 void oracle_vpxorq     (const void *a, const void *b, void *dst, uint64_t m, int z);
 void oracle_vpternlogq_ca(const void *a, const void *b, void *dst, uint64_t m, int z);
 void oracle_vpsllvq    (const void *a, const void *b, void *dst, uint64_t m, int z);
 void oracle_vpmullq    (const void *a, const void *b, void *dst, uint64_t m, int z);
 void oracle_vpopcntq   (const void *a, const void *b, void *dst, uint64_t m, int z);
 void oracle_vplzcntq   (const void *a, const void *b, void *dst, uint64_t m, int z);
+void oracle_vpexpandd  (const void *a, const void *b, void *dst, uint64_t m, int z);
+void oracle_vpexpandd_ymm(const void *a, const void *b, void *dst, uint64_t m, int z);
+void oracle_vpexpandd_xmm(const void *a, const void *b, void *dst, uint64_t m, int z);
+void oracle_vpgatherdd (const void *a, const void *b, void *dst, uint64_t m, int z);
+void oracle_vpcompressd(const void *a, const void *b, void *dst, uint64_t m, int z);
+void oracle_vpcompressd_ymm(const void *a, const void *b, void *dst, uint64_t m, int z);
+void oracle_vpcompressd_xmm(const void *a, const void *b, void *dst, uint64_t m, int z);
+void oracle_vpscatterdd(const void *a, const void *b, void *dst, uint64_t m, int z);
 void oracle_intentional_fault(const void *a, const void *b, void *dst, uint64_t m, int z);
 
 const insn_spec_t insn_specs[INSN_CLASS_COUNT] = {
@@ -334,12 +483,24 @@ const insn_spec_t insn_specs[INSN_CLASS_COUNT] = {
 	[INSN_VMOVDQU8]      = {"vmovdqu8",      0, 0, exec_vmovdqu8,      oracle_vmovdqu8},
 	[INSN_VPADDQ]        = {"vpaddq",        0, 1, exec_vpaddq,        oracle_vpaddq},
 	[INSN_VPADDB]        = {"vpaddb",        0, 1, exec_vpaddb,        oracle_vpaddb},
+	[INSN_VPADDD]        = {"vpaddd",        0, 1, exec_vpaddd,        oracle_vpaddd},
+	[INSN_VPADDW]        = {"vpaddw",        0, 1, exec_vpaddw,        oracle_vpaddw},
 	[INSN_VPXORQ]        = {"vpxorq",        0, 1, exec_vpxorq,        oracle_vpxorq},
 	[INSN_VPTERNLOGQ_CA] = {"vpternlogq_CA", 0, 1, exec_vpternlogq_ca, oracle_vpternlogq_ca},
 	[INSN_VPSLLVQ]       = {"vpsllvq",       0, 1, exec_vpsllvq,       oracle_vpsllvq},
 	[INSN_VPMULLQ]       = {"vpmullq",       0, 1, exec_vpmullq,       oracle_vpmullq},
 	[INSN_VPOPCNTQ]      = {"vpopcntq",      0, 0, exec_vpopcntq,      oracle_vpopcntq},
 	[INSN_VPLZCNTQ]      = {"vplzcntq",      0, 0, exec_vplzcntq,      oracle_vplzcntq},
+	[INSN_VPEXPANDD]     = {"vpexpandd",     0, 0, exec_vpexpandd,     oracle_vpexpandd},
+	[INSN_VPEXPANDD_YMM] = {"vpexpandd_ymm", 0, 0, exec_vpexpandd_ymm, oracle_vpexpandd_ymm},
+	[INSN_VPEXPANDD_XMM] = {"vpexpandd_xmm", 0, 0, exec_vpexpandd_xmm, oracle_vpexpandd_xmm},
+	[INSN_VPGATHERDD]    = {"vpgatherdd",    0, 1, exec_vpgatherdd,    oracle_vpgatherdd},
+	[INSN_VPCOMPRESSD]   = {"vpcompressd",   0, 0, exec_vpcompressd,   oracle_vpcompressd},
+	[INSN_VPCOMPRESSD_YMM] = {"vpcompressd_ymm", 0, 0,
+	                          exec_vpcompressd_ymm, oracle_vpcompressd_ymm},
+	[INSN_VPCOMPRESSD_XMM] = {"vpcompressd_xmm", 0, 0,
+	                          exec_vpcompressd_xmm, oracle_vpcompressd_xmm},
+	[INSN_VPSCATTERDD]   = {"vpscatterdd",   0, 1, exec_vpscatterdd,   oracle_vpscatterdd},
 	[INSN_INTENTIONAL_FAULT] = {"intentional_fault", 0, 0,
 	                            exec_intentional_fault, oracle_intentional_fault},
 };

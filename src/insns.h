@@ -19,6 +19,16 @@ typedef enum {
 	INSN_VPOPCNTQ  = 10,
 	INSN_VPLZCNTQ  = 11,
 	INSN_INTENTIONAL_FAULT = 12,
+	INSN_VPADDD    = 13,
+	INSN_VPADDW    = 14,
+	INSN_VPEXPANDD = 15,
+	INSN_VPEXPANDD_YMM = 16,
+	INSN_VPEXPANDD_XMM = 17,
+	INSN_VPGATHERDD = 18,
+	INSN_VPCOMPRESSD = 19,
+	INSN_VPCOMPRESSD_YMM = 20,
+	INSN_VPCOMPRESSD_XMM = 21,
+	INSN_VPSCATTERDD = 22,
 
 	INSN_CLASS_COUNT
 } insn_class_t;
@@ -43,7 +53,10 @@ typedef enum {
  *   mask:       full 64-bit k-register value. Each op uses only the low N
  *               bits matching its element granularity.
  *   zeromask:   non-zero selects {z}, zero selects merge-masking.
- * Unary ops ignore b_in. */
+ * Unary ops ignore b_in. Gather ops use a_in as indices and b_in as the
+ * backing memory region. Scatter ops use a_in as values and b_in as
+ * indices. Compress-store forms ignore zeromask because their destination
+ * is memory, not a mergeable vector register. */
 typedef void (*insn_fn_t)(const void *a_in, const void *b_in, void *dst,
                           uint64_t mask, int zeromask);
 

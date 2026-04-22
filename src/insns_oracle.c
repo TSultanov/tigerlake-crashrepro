@@ -19,6 +19,33 @@ static inline int mask_bit(uint64_t m, int elem) {
 	return (int)((m >> elem) & 1);
 }
 
+static inline uint32_t bounded_dword_offset(uint32_t raw) {
+	return raw & 60u;
+}
+
+static inline uint32_t load_u32_unaligned(const uint8_t *p) {
+	uint32_t v;
+	memcpy(&v, p, sizeof v);
+	return v;
+}
+
+static void sanitize_scatter_offsets_dword(const void *b_in, uint32_t *off_out,
+	                                       uint32_t lanes) {
+	uint32_t raw[16];
+	uint32_t slots[16];
+
+	memcpy(raw, b_in, sizeof raw);
+	for (uint32_t i = 0; i < lanes; i++) {
+		slots[i] = i;
+	}
+	for (uint32_t i = 0; i < lanes; i++) {
+		uint32_t remain = lanes - i;
+		uint32_t pick = raw[i] % remain;
+		off_out[i] = slots[pick] * 4u;
+		slots[pick] = slots[remain - 1u];
+	}
+}
+
 /* ---------- moves ---------- */
 
 NOVEC void oracle_vmovdqu64(const void *a_in, const void *b_in, void *dst,
@@ -93,6 +120,34 @@ NOVEC void oracle_vpaddb(const void *a_in, const void *b_in, void *dst,
 	for (int i = 0; i < 64; i++) {
 		if (mask_bit(m, i)) {
 			d[i] = (uint8_t)(a[i] + b[i]);
+		} else if (zeromask) {
+			d[i] = 0;
+		}
+	}
+}
+
+NOVEC void oracle_vpaddd(const void *a_in, const void *b_in, void *dst,
+	                 uint64_t m, int zeromask) {
+	const uint32_t *a = (const uint32_t *)a_in;
+	const uint32_t *b = (const uint32_t *)b_in;
+	uint32_t *d = (uint32_t *)dst;
+	for (int i = 0; i < 16; i++) {
+		if (mask_bit(m, i)) {
+			d[i] = a[i] + b[i];
+		} else if (zeromask) {
+			d[i] = 0;
+		}
+	}
+}
+
+NOVEC void oracle_vpaddw(const void *a_in, const void *b_in, void *dst,
+	                 uint64_t m, int zeromask) {
+	const uint16_t *a = (const uint16_t *)a_in;
+	const uint16_t *b = (const uint16_t *)b_in;
+	uint16_t *d = (uint16_t *)dst;
+	for (int i = 0; i < 32; i++) {
+		if (mask_bit(m, i)) {
+			d[i] = (uint16_t)(a[i] + b[i]);
 		} else if (zeromask) {
 			d[i] = 0;
 		}
@@ -232,6 +287,115 @@ NOVEC void oracle_vplzcntq(const void *a_in, const void *b_in, void *dst,
 			d[i] = r;
 		} else if (zeromask) {
 			d[i] = 0;
+		}
+	}
+}
+
+static void oracle_vpexpandd_vl(const void *a_in, void *dst, uint64_t m,
+	                            int zeromask, int lanes) {
+	const uint32_t *a = (const uint32_t *)a_in;
+	uint32_t old[16];
+	uint32_t out[16] = {0};
+	int src = 0;
+
+	memcpy(old, dst, sizeof old);
+	for (int i = 0; i < lanes; i++) {
+		if (mask_bit(m, i)) {
+			out[i] = a[src++];
+		} else if (zeromask) {
+			out[i] = 0;
+		} else {
+			out[i] = old[i];
+		}
+	}
+	memcpy(dst, out, sizeof out);
+}
+
+static void oracle_vpcompressd_vl(const void *a_in, void *dst, uint64_t m,
+	                             int lanes) {
+	uint32_t src[16];
+	uint32_t *d = (uint32_t *)dst;
+	int out = 0;
+
+	memcpy(src, a_in, sizeof src);
+	for (int i = 0; i < lanes; i++) {
+		if (mask_bit(m, i)) {
+			d[out++] = src[i];
+		}
+	}
+}
+
+NOVEC void oracle_vpexpandd(const void *a_in, const void *b_in, void *dst,
+	                    uint64_t m, int zeromask) {
+	(void)b_in;
+	oracle_vpexpandd_vl(a_in, dst, m, zeromask, 16);
+}
+
+NOVEC void oracle_vpexpandd_ymm(const void *a_in, const void *b_in, void *dst,
+	                        uint64_t m, int zeromask) {
+	(void)b_in;
+	oracle_vpexpandd_vl(a_in, dst, m, zeromask, 8);
+}
+
+NOVEC void oracle_vpexpandd_xmm(const void *a_in, const void *b_in, void *dst,
+	                        uint64_t m, int zeromask) {
+	(void)b_in;
+	oracle_vpexpandd_vl(a_in, dst, m, zeromask, 4);
+}
+
+NOVEC void oracle_vpgatherdd(const void *a_in, const void *b_in, void *dst,
+	                    uint64_t m, int zeromask) {
+	const uint32_t *idx = (const uint32_t *)a_in;
+	const uint8_t *base = (const uint8_t *)b_in;
+	uint32_t old[16];
+	uint32_t out[16];
+
+	memcpy(old, dst, sizeof old);
+	for (int i = 0; i < 16; i++) {
+		if (mask_bit(m, i)) {
+			out[i] = load_u32_unaligned(base + bounded_dword_offset(idx[i]));
+		} else if (zeromask) {
+			out[i] = 0;
+		} else {
+			out[i] = old[i];
+		}
+	}
+	memcpy(dst, out, sizeof out);
+}
+
+NOVEC void oracle_vpcompressd(const void *a_in, const void *b_in, void *dst,
+	                       uint64_t m, int zeromask) {
+	(void)b_in;
+	(void)zeromask;
+	oracle_vpcompressd_vl(a_in, dst, m, 16);
+}
+
+NOVEC void oracle_vpcompressd_ymm(const void *a_in, const void *b_in, void *dst,
+	                           uint64_t m, int zeromask) {
+	(void)b_in;
+	(void)zeromask;
+	oracle_vpcompressd_vl(a_in, dst, m, 8);
+}
+
+NOVEC void oracle_vpcompressd_xmm(const void *a_in, const void *b_in, void *dst,
+	                           uint64_t m, int zeromask) {
+	(void)b_in;
+	(void)zeromask;
+	oracle_vpcompressd_vl(a_in, dst, m, 4);
+}
+
+NOVEC void oracle_vpscatterdd(const void *a_in, const void *b_in, void *dst,
+	                       uint64_t m, int zeromask) {
+	uint32_t src[16];
+	uint32_t off[16];
+	uint8_t *d = (uint8_t *)dst;
+	(void)zeromask;
+
+	memcpy(src, a_in, sizeof src);
+	sanitize_scatter_offsets_dword(b_in, off, 16u);
+	for (int i = 0; i < 16; i++) {
+		if (mask_bit(m, i)) {
+			memcpy(d + off[i], &src[i], sizeof src[i]);
 		}
 	}
 }
