@@ -147,27 +147,32 @@ static uint64_t pick_us(prng_t *p, uint32_t min_us, uint32_t max_us) {
 	return min_us + (prng_u32(p) % (max_us - min_us + 1u));
 }
 
-void power_churn_cycle(prng_t *p, const power_cfg_t *cfg, power_stats_t *st) {
-	/* Burst between 50 µs and 2 ms; gap between 10 µs and 200 µs.
-	 * 50 µs is enough to demote the core to the AVX-512 license on Tiger
-	 * Lake; 2 ms exceeds the license-hold window so the core is forced to
-	 * downclock. The gap lets it ramp back up. We vary whether that gap is
-	 * passive, scalar-active, AVX2-active, or part of a rapid re-entry train. */
+void power_churn_plan(prng_t *p, const power_cfg_t *cfg, power_plan_t *plan) {
 	power_cfg_t defaults;
 	const power_cfg_t *use_cfg;
-	power_profile_t profile;
-	uint64_t burst_us;
-	uint64_t gap_us;
-	uint8_t mem[320] __attribute__((aligned(64)));
 
 	defaults = power_cfg_default();
 	use_cfg = cfg ? cfg : &defaults;
-	profile = use_cfg->profile;
-	if (profile == POWER_PROFILE_RANDOM) {
-		profile = (power_profile_t)(POWER_PROFILE_PASSIVE + (prng_u32(p) % 4u));
+	plan->profile = use_cfg->profile;
+	if (plan->profile == POWER_PROFILE_RANDOM) {
+		plan->profile = (power_profile_t)(POWER_PROFILE_PASSIVE + (prng_u32(p) % 4u));
 	}
-	burst_us = pick_us(p, use_cfg->burst_min_us, use_cfg->burst_max_us);
-	gap_us = pick_us(p, use_cfg->gap_min_us, use_cfg->gap_max_us);
+	plan->burst_us = (uint32_t)pick_us(p, use_cfg->burst_min_us, use_cfg->burst_max_us);
+	plan->gap_us = (uint32_t)pick_us(p, use_cfg->gap_min_us, use_cfg->gap_max_us);
+	plan->reentry_us = (uint32_t)pick_us(p, use_cfg->reentry_min_us, use_cfg->reentry_max_us);
+}
+
+void power_churn_cycle(prng_t *p, const power_plan_t *plan, power_stats_t *st) {
+	power_plan_t fallback;
+	const power_plan_t *use_plan;
+	uint8_t mem[320] __attribute__((aligned(64)));
+
+	if (plan) {
+		use_plan = plan;
+	} else {
+		power_churn_plan(p, NULL, &fallback);
+		use_plan = &fallback;
+	}
 
 	for (size_t i = 0; i < sizeof mem; i += 8) {
 		uint64_t v = prng_u64(p);
@@ -176,42 +181,34 @@ void power_churn_cycle(prng_t *p, const power_cfg_t *cfg, power_stats_t *st) {
 
 	uint64_t start = now_ns();
 	uint64_t iters = 0;
-	switch (profile) {
+	switch (use_plan->profile) {
 	case POWER_PROFILE_PASSIVE:
 		/* Baseline: long AVX-512 burst followed by a passive cool-off. */
-		run_burst_window(p, mem, burst_us, &iters);
-		usleep((useconds_t)gap_us);
+		run_burst_window(p, mem, use_plan->burst_us, &iters);
+		usleep((useconds_t)use_plan->gap_us);
 		break;
 	case POWER_PROFILE_SCALAR:
 		/* Decay the license while keeping the thread active in scalar code,
 		 * then quickly re-enter AVX-512. */
-		run_burst_window(p, mem, burst_us, &iters);
-		run_scalar_gap_window(gap_us);
-		run_burst_window(p, mem,
-		                 pick_us(p, use_cfg->reentry_min_us, use_cfg->reentry_max_us),
-		                 &iters);
+		run_burst_window(p, mem, use_plan->burst_us, &iters);
+		run_scalar_gap_window(use_plan->gap_us);
+		run_burst_window(p, mem, use_plan->reentry_us, &iters);
 		break;
 	case POWER_PROFILE_AVX2:
 		/* Bridge through an AVX2 phase before re-entering AVX-512. */
-		run_burst_window(p, mem, burst_us, &iters);
-		run_avx2_gap_window(gap_us);
-		run_burst_window(p, mem,
-		                 pick_us(p, use_cfg->reentry_min_us, use_cfg->reentry_max_us),
-		                 &iters);
+		run_burst_window(p, mem, use_plan->burst_us, &iters);
+		run_avx2_gap_window(use_plan->gap_us);
+		run_burst_window(p, mem, use_plan->reentry_us, &iters);
 		break;
 	case POWER_PROFILE_TRAIN:
 	default:
 		/* A train of shorter bursts separated by mixed tiny gaps to hit
 		 * rapid downclock/ramp-up edges repeatedly in one cycle. */
-		run_burst_window(p, mem, burst_us / 2u + 1u, &iters);
-		usleep((useconds_t)(gap_us / 3u + 1u));
-		run_burst_window(p, mem,
-		                 pick_us(p, use_cfg->reentry_min_us, use_cfg->reentry_max_us),
-		                 &iters);
-		run_scalar_gap_window(gap_us / 2u + 1u);
-		run_burst_window(p, mem,
-		                 pick_us(p, use_cfg->reentry_min_us, use_cfg->reentry_max_us),
-		                 &iters);
+		run_burst_window(p, mem, use_plan->burst_us / 2u + 1u, &iters);
+		usleep((useconds_t)(use_plan->gap_us / 3u + 1u));
+		run_burst_window(p, mem, use_plan->reentry_us, &iters);
+		run_scalar_gap_window(use_plan->gap_us / 2u + 1u);
+		run_burst_window(p, mem, use_plan->reentry_us, &iters);
 		break;
 	}
 

@@ -46,6 +46,13 @@ static inline power_cfg_t power_cfg_default(void) {
 	return cfg;
 }
 
+typedef struct {
+	power_profile_t profile;
+	uint32_t        burst_us;
+	uint32_t        gap_us;
+	uint32_t        reentry_us;
+} power_plan_t;
+
 /* Deliberate AVX-512 frequency / voltage churn. Interleaves bursts of
  * heavy zmm-register arithmetic and memory traffic (which drive the
  * AVX-512 frequency license and demand peak VR draw) with several kinds
@@ -63,6 +70,7 @@ typedef struct {
 /* Run one burst-then-gap cycle with randomised parameters.
  * Safe to call from any thread; uses only zmm registers the caller has
  * not pinned to other uses. */
-void power_churn_cycle(prng_t *p, const power_cfg_t *cfg, power_stats_t *st);
+void power_churn_plan(prng_t *p, const power_cfg_t *cfg, power_plan_t *plan);
+void power_churn_cycle(prng_t *p, const power_plan_t *plan, power_stats_t *st);
 
 #endif

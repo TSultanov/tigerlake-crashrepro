@@ -419,6 +419,7 @@ int fuzz_run(const fuzz_cfg_t *cfg) {
 	uint64_t expected_faults = 0;
 	uint64_t missed_faults = 0;
 	uint64_t iter = 0;
+	log_entry_t *last_entry = NULL;
 	uint64_t report_every = 1ull << 16;   /* ~65k iters */
 	uint64_t next_report = report_every;
 	uint64_t last_ns = now_ns();
@@ -473,6 +474,7 @@ int fuzz_run(const fuzz_cfg_t *cfg) {
 			uint32_t variant = prng_u32(&p) % INSN_FAULT_VAR_COUNT;
 			log_entry_t *e = logger_begin_fault(&lg, iter, cls, /*flags*/0,
 			                                    bad, variant);
+			last_entry = e;
 			if (sigsetjmp(sighandler_recovery_buf, 1) == 0) {
 				sighandler_arm_expected_fault(bad, e);
 				/* Dispatch; handler should longjmp back before this
@@ -554,6 +556,7 @@ int fuzz_run(const fuzz_cfg_t *cfg) {
 			}
 		}
 		logger_end(&lg, e, out_hash, status);
+		last_entry = e;
 
 		iter++;
 	end_of_iter: ;
@@ -563,7 +566,15 @@ int fuzz_run(const fuzz_cfg_t *cfg) {
 		 * lets the core clock back up. Tiger Lake's suspected crash sits
 		 * right on this transition, so this is a primary provocation. */
 		if (cfg->churn && (prng_u32(&p) & 0xFFu) == 0) {
-			power_churn_cycle(&p, &cfg->power, &pwr);
+			power_plan_t churn_plan;
+			power_churn_plan(&p, &cfg->power, &churn_plan);
+			if (last_entry) {
+				uint32_t churn_flags = last_entry->flags |
+				                      LOG_FLAG_CHURN_ACTIVE |
+				                      LOG_ENCODE_CHURN_PROFILE(churn_plan.profile);
+				logger_update_flags(&lg, last_entry, churn_flags);
+			}
+			power_churn_cycle(&p, &churn_plan, &pwr);
 		}
 
 		if (!cfg->quiet && iter == next_report) {

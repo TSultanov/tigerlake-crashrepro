@@ -26,10 +26,15 @@
 #define LOG_FLAG_EXPECTING_FAULT    (1u << 2)  /* op was intentionally aimed at a bad address */
 #define LOG_FLAG_SHARED_DST         (1u << 3)
 #define LOG_FLAG_INTERRUPT_PRESSURE (1u << 4)
+#define LOG_FLAG_CHURN_ACTIVE       (1u << 5)
 #define LOG_FLAG_KREG_SHIFT         8u
 #define LOG_FLAG_KREG_MASK          (7u << LOG_FLAG_KREG_SHIFT)
 #define LOG_ENCODE_KREG(kreg)       ((((uint32_t)(kreg)) & 7u) << LOG_FLAG_KREG_SHIFT)
 #define LOG_DECODE_KREG(flags)      ((((uint32_t)(flags)) & LOG_FLAG_KREG_MASK) >> LOG_FLAG_KREG_SHIFT)
+#define LOG_FLAG_CHURN_PROFILE_SHIFT 12u
+#define LOG_FLAG_CHURN_PROFILE_MASK  (7u << LOG_FLAG_CHURN_PROFILE_SHIFT)
+#define LOG_ENCODE_CHURN_PROFILE(profile) ((((uint32_t)(profile)) & 7u) << LOG_FLAG_CHURN_PROFILE_SHIFT)
+#define LOG_DECODE_CHURN_PROFILE(flags) ((((uint32_t)(flags)) & LOG_FLAG_CHURN_PROFILE_MASK) >> LOG_FLAG_CHURN_PROFILE_SHIFT)
 
 /* On-disk entry. Keep small and fixed-layout. Append-only — any new field
  * goes at the end and bumps LOG_VERSION. */
@@ -97,6 +102,9 @@ log_entry_t *logger_begin_fault(logger_t *lg, uint64_t iter,
 /* Patch the entry with final output hash and status, then msync again. */
 void logger_end(logger_t *lg, log_entry_t *e,
                 uint64_t output_hash, uint64_t status);
+
+/* Patch only the flags for an entry and msync the entry again. */
+void logger_update_flags(logger_t *lg, log_entry_t *e, uint32_t flags);
 
 /* Simple streaming FNV-1a 64. */
 uint64_t fnv1a64(const void *data, uint32_t len);

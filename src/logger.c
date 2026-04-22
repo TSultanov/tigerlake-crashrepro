@@ -25,6 +25,11 @@ uint64_t fnv1a64(const void *data, uint32_t len) {
 	return h;
 }
 
+static const char *churn_scope_name(uint32_t flags) {
+	if ((flags & LOG_FLAG_CHURN_ACTIVE) == 0) return "nochurn";
+	return power_profile_name((power_profile_t)LOG_DECODE_CHURN_PROFILE(flags));
+}
+
 static int mkdir_p(const char *path) {
 	/* lightweight mkdir -p: handles absolute paths with no leading . */
 	char buf[1024];
@@ -198,6 +203,12 @@ void logger_end(logger_t *lg, log_entry_t *e,
 	msync(e, sizeof *e, MS_SYNC);
 }
 
+void logger_update_flags(logger_t *lg, log_entry_t *e, uint32_t flags) {
+	(void)lg;
+	e->flags = flags;
+	msync(e, sizeof *e, MS_SYNC);
+}
+
 static const char *status_str(uint64_t s) {
 	switch (s) {
 	case LOG_STATUS_IN_FLIGHT:      return "IN_FLIGHT";
@@ -247,7 +258,7 @@ int logger_dump(const char *path) {
 		uint32_t idx = (lf->ring_pos + i) % lf->ring_len;
 		const log_entry_t *e = &lf->entries[idx];
 		if (e->timestamp_ns == 0) continue;
-		printf("  iter=%-8llu ts=%llu insn=%u shape=%u(%s) dst=%s irq=%s kreg=k%u mask32=0x%08x "
+		printf("  iter=%-8llu ts=%llu insn=%u shape=%u(%s) dst=%s irq=%s churn=%s kreg=k%u mask32=0x%08x "
 		       "off=%u zmm=%u flags=0x%x status=%s in=%016llx out=%016llx",
 		       (unsigned long long)e->iter,
 		       (unsigned long long)e->timestamp_ns,
@@ -255,6 +266,7 @@ int logger_dump(const char *path) {
 		       operand_shape_name(e->operand_shape),
 		       (e->flags & LOG_FLAG_SHARED_DST) ? "shared" : "private",
 		       (e->flags & LOG_FLAG_INTERRUPT_PRESSURE) ? "on" : "off",
+		       churn_scope_name(e->flags),
 		       LOG_DECODE_KREG(e->flags), e->mask_pattern,
 		       e->alignment_offset, e->zmm_dst, e->flags,
 		       status_str(e->status),
