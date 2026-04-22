@@ -1,9 +1,7 @@
 /* AVX-512 inline-asm executors for every class listed in insns.h.
  *
  * Conventions:
- * - Register bank: zmm0 = A, zmm1 = B, zmm2 = dst/result, k1 = mask.
- *   (A dedicated "bank B" using zmm28/29/30 + k3 lives at the end and is
- *   selected by the caller through _hi variants.)
+ * - Register bank: zmm0 = A, zmm1 = B, zmm2 = dst/result, k1..k7 = mask.
  * - For merge-masking, the dst memory is loaded into zmm2 *before* the
  *   masked op so non-selected lanes keep their prior values — that mirrors
  *   what the hardware does with an in-register destination.
@@ -24,166 +22,191 @@
 #define STORE_ZMM2(ptr)                                        \
 	"vmovdqu64 %%zmm2, (" ptr ")\n\t"
 
+#define KREG_MASK_STR(kreg) "%{%%" #kreg "%}"
+#define KREG_MASK_Z_STR(kreg) KREG_MASK_STR(kreg) "%{z%}"
+
+#define DISPATCH_KREG(body, ...)                                        \
+	do {                                                              \
+		switch (insn_get_kreg()) {                                  \
+		case 2:  body(k2, __VA_ARGS__); break;                      \
+		case 3:  body(k3, __VA_ARGS__); break;                      \
+		case 4:  body(k4, __VA_ARGS__); break;                      \
+		case 5:  body(k5, __VA_ARGS__); break;                      \
+		case 6:  body(k6, __VA_ARGS__); break;                      \
+		case 7:  body(k7, __VA_ARGS__); break;                      \
+		case 1:                                                     \
+		default: body(k1, __VA_ARGS__); break;                      \
+		}                                                         \
+	} while (0)
+
+#define BODY_MOV_MASK_Q(kreg, load_insn, store_insn)                       \
+	do {                                                                 \
+		if (zeromask) {                                                \
+			__asm__ volatile(                                        \
+				"kmovq %2, %%" #kreg "\n\t"                     \
+				load_insn " (%0), %%zmm2 " KREG_MASK_Z_STR(kreg) "\n\t" \
+				store_insn " %%zmm2, (%1)\n\t"                  \
+				: : "r"(a), "r"(dst), "r"(mask)                  \
+				: "zmm2", #kreg, "memory");                       \
+		} else {                                                      \
+			__asm__ volatile(                                        \
+				"vmovdqu64 (%1), %%zmm2\n\t"                    \
+				"kmovq %2, %%" #kreg "\n\t"                     \
+				load_insn " (%0), %%zmm2 " KREG_MASK_STR(kreg) "\n\t" \
+				store_insn " %%zmm2, (%1)\n\t"                  \
+				: : "r"(a), "r"(dst), "r"(mask)                  \
+				: "zmm2", #kreg, "memory");                       \
+		}                                                             \
+	} while (0)
+
+#define BODY_MOV_MASK_W(kreg, load_insn)                                  \
+	do {                                                                 \
+		if (zeromask) {                                                \
+			__asm__ volatile(                                        \
+				"kmovw %k2, %%" #kreg "\n\t"                    \
+				load_insn " (%0), %%zmm2 " KREG_MASK_Z_STR(kreg) "\n\t" \
+				"vmovdqu64 %%zmm2, (%1)\n\t"                     \
+				: : "r"(a), "r"(dst), "r"((uint32_t)mask)        \
+				: "zmm2", #kreg, "memory");                       \
+		} else {                                                      \
+			__asm__ volatile(                                        \
+				"vmovdqu64 (%1), %%zmm2\n\t"                    \
+				"kmovw %k2, %%" #kreg "\n\t"                    \
+				load_insn " (%0), %%zmm2 " KREG_MASK_STR(kreg) "\n\t" \
+				"vmovdqu64 %%zmm2, (%1)\n\t"                     \
+				: : "r"(a), "r"(dst), "r"((uint32_t)mask)        \
+				: "zmm2", #kreg, "memory");                       \
+		}                                                             \
+	} while (0)
+
+#define BODY_BINARY_MASK_Q(kreg, op_insn)                                 \
+	do {                                                                 \
+		if (zeromask) {                                                \
+			__asm__ volatile(                                        \
+				"vmovdqu64 (%0), %%zmm0\n\t"                    \
+				"vmovdqu64 (%1), %%zmm1\n\t"                    \
+				"kmovq %3, %%" #kreg "\n\t"                     \
+				op_insn KREG_MASK_Z_STR(kreg) "\n\t"             \
+				"vmovdqu64 %%zmm2, (%2)\n\t"                     \
+				: : "r"(a), "r"(b), "r"(dst), "r"(mask)         \
+				: "zmm0", "zmm1", "zmm2", #kreg, "memory");  \
+		} else {                                                      \
+			__asm__ volatile(                                        \
+				"vmovdqu64 (%0), %%zmm0\n\t"                    \
+				"vmovdqu64 (%1), %%zmm1\n\t"                    \
+				"vmovdqu64 (%2), %%zmm2\n\t"                    \
+				"kmovq %3, %%" #kreg "\n\t"                     \
+				op_insn KREG_MASK_STR(kreg) "\n\t"               \
+				"vmovdqu64 %%zmm2, (%2)\n\t"                     \
+				: : "r"(a), "r"(b), "r"(dst), "r"(mask)         \
+				: "zmm0", "zmm1", "zmm2", #kreg, "memory");  \
+		}                                                             \
+	} while (0)
+
+#define BODY_TERNARY_MASK_Q(kreg, op_insn)                                \
+	do {                                                                 \
+		if (zeromask) {                                                \
+			__asm__ volatile(                                        \
+				"vmovdqu64 (%0), %%zmm0\n\t"                    \
+				"vmovdqu64 (%1), %%zmm1\n\t"                    \
+				"vmovdqu64 (%2), %%zmm2\n\t"                    \
+				"kmovq %3, %%" #kreg "\n\t"                     \
+				op_insn KREG_MASK_Z_STR(kreg) "\n\t"             \
+				"vmovdqu64 %%zmm2, (%2)\n\t"                     \
+				: : "r"(a), "r"(b), "r"(dst), "r"(mask)         \
+				: "zmm0", "zmm1", "zmm2", #kreg, "memory");  \
+		} else {                                                      \
+			__asm__ volatile(                                        \
+				"vmovdqu64 (%0), %%zmm0\n\t"                    \
+				"vmovdqu64 (%1), %%zmm1\n\t"                    \
+				"vmovdqu64 (%2), %%zmm2\n\t"                    \
+				"kmovq %3, %%" #kreg "\n\t"                     \
+				op_insn KREG_MASK_STR(kreg) "\n\t"               \
+				"vmovdqu64 %%zmm2, (%2)\n\t"                     \
+				: : "r"(a), "r"(b), "r"(dst), "r"(mask)         \
+				: "zmm0", "zmm1", "zmm2", #kreg, "memory");  \
+		}                                                             \
+	} while (0)
+
+#define BODY_UNARY_MASK_Q(kreg, op_insn)                                  \
+	do {                                                                 \
+		if (zeromask) {                                                \
+			__asm__ volatile(                                        \
+				"vmovdqu64 (%0), %%zmm0\n\t"                    \
+				"kmovq %2, %%" #kreg "\n\t"                     \
+				op_insn KREG_MASK_Z_STR(kreg) "\n\t"             \
+				"vmovdqu64 %%zmm2, (%1)\n\t"                     \
+				: : "r"(a), "r"(dst), "r"(mask)                  \
+				: "zmm0", "zmm2", #kreg, "memory");            \
+		} else {                                                      \
+			__asm__ volatile(                                        \
+				"vmovdqu64 (%0), %%zmm0\n\t"                    \
+				"vmovdqu64 (%1), %%zmm2\n\t"                    \
+				"kmovq %2, %%" #kreg "\n\t"                     \
+				op_insn KREG_MASK_STR(kreg) "\n\t"               \
+				"vmovdqu64 %%zmm2, (%1)\n\t"                     \
+				: : "r"(a), "r"(dst), "r"(mask)                  \
+				: "zmm0", "zmm2", #kreg, "memory");            \
+		}                                                             \
+	} while (0)
+
+static __thread uint32_t tls_kreg = INSN_KREG_MIN;
+
+void insn_set_kreg(uint32_t kreg) {
+	if (kreg < INSN_KREG_MIN || kreg > INSN_KREG_MAX) {
+		tls_kreg = INSN_KREG_MIN;
+		return;
+	}
+	tls_kreg = kreg;
+}
+
+uint32_t insn_get_kreg(void) {
+	return tls_kreg;
+}
+
 /* ---------- moves ---------- */
 
 static void exec_vmovdqu64(const void *a, const void *b, void *dst,
                            uint64_t mask, int zeromask) {
 	(void)b;
-	if (zeromask) {
-		__asm__ volatile(
-			"kmovq %2, %%k1\n\t"
-			"vmovdqu64 (%0), %%zmm2 %{%%k1%}%{z%}\n\t"
-			"vmovdqu64 %%zmm2, (%1)\n\t"
-			: : "r"(a), "r"(dst), "r"(mask)
-			: "zmm2", "k1", "memory");
-	} else {
-		__asm__ volatile(
-			"vmovdqu64 (%1), %%zmm2\n\t"
-			"kmovq %2, %%k1\n\t"
-			"vmovdqu64 (%0), %%zmm2 %{%%k1%}\n\t"
-			"vmovdqu64 %%zmm2, (%1)\n\t"
-			: : "r"(a), "r"(dst), "r"(mask)
-			: "zmm2", "k1", "memory");
-	}
+	DISPATCH_KREG(BODY_MOV_MASK_Q, "vmovdqu64", "vmovdqu64");
 }
 
 static void exec_vmovdqa64(const void *a, const void *b, void *dst,
                            uint64_t mask, int zeromask) {
 	(void)b;
-	if (zeromask) {
-		__asm__ volatile(
-			"kmovq %2, %%k1\n\t"
-			"vmovdqa64 (%0), %%zmm2 %{%%k1%}%{z%}\n\t"
-			"vmovdqa64 %%zmm2, (%1)\n\t"
-			: : "r"(a), "r"(dst), "r"(mask)
-			: "zmm2", "k1", "memory");
-	} else {
-		__asm__ volatile(
-			"vmovdqa64 (%1), %%zmm2\n\t"
-			"kmovq %2, %%k1\n\t"
-			"vmovdqa64 (%0), %%zmm2 %{%%k1%}\n\t"
-			"vmovdqa64 %%zmm2, (%1)\n\t"
-			: : "r"(a), "r"(dst), "r"(mask)
-			: "zmm2", "k1", "memory");
-	}
+	DISPATCH_KREG(BODY_MOV_MASK_Q, "vmovdqa64", "vmovdqa64");
 }
 
 static void exec_vmovdqu32(const void *a, const void *b, void *dst,
                            uint64_t mask, int zeromask) {
 	(void)b;
-	if (zeromask) {
-		__asm__ volatile(
-			"kmovw %k2, %%k1\n\t"
-			"vmovdqu32 (%0), %%zmm2 %{%%k1%}%{z%}\n\t"
-			"vmovdqu64 %%zmm2, (%1)\n\t"
-			: : "r"(a), "r"(dst), "r"((uint32_t)mask)
-			: "zmm2", "k1", "memory");
-	} else {
-		__asm__ volatile(
-			"vmovdqu64 (%1), %%zmm2\n\t"
-			"kmovw %k2, %%k1\n\t"
-			"vmovdqu32 (%0), %%zmm2 %{%%k1%}\n\t"
-			"vmovdqu64 %%zmm2, (%1)\n\t"
-			: : "r"(a), "r"(dst), "r"((uint32_t)mask)
-			: "zmm2", "k1", "memory");
-	}
+	DISPATCH_KREG(BODY_MOV_MASK_W, "vmovdqu32");
 }
 
 static void exec_vmovdqu8(const void *a, const void *b, void *dst,
                           uint64_t mask, int zeromask) {
 	(void)b;
-	if (zeromask) {
-		__asm__ volatile(
-			"kmovq %2, %%k1\n\t"
-			"vmovdqu8 (%0), %%zmm2 %{%%k1%}%{z%}\n\t"
-			"vmovdqu64 %%zmm2, (%1)\n\t"
-			: : "r"(a), "r"(dst), "r"(mask)
-			: "zmm2", "k1", "memory");
-	} else {
-		__asm__ volatile(
-			"vmovdqu64 (%1), %%zmm2\n\t"
-			"kmovq %2, %%k1\n\t"
-			"vmovdqu8 (%0), %%zmm2 %{%%k1%}\n\t"
-			"vmovdqu64 %%zmm2, (%1)\n\t"
-			: : "r"(a), "r"(dst), "r"(mask)
-			: "zmm2", "k1", "memory");
-	}
+	DISPATCH_KREG(BODY_MOV_MASK_Q, "vmovdqu8", "vmovdqu64");
 }
 
 /* ---------- integer add ---------- */
 
 static void exec_vpaddq(const void *a, const void *b, void *dst,
                         uint64_t mask, int zeromask) {
-	if (zeromask) {
-		__asm__ volatile(
-			"vmovdqu64 (%0), %%zmm0\n\t"
-			"vmovdqu64 (%1), %%zmm1\n\t"
-			"kmovq %3, %%k1\n\t"
-			"vpaddq %%zmm1, %%zmm0, %%zmm2 %{%%k1%}%{z%}\n\t"
-			"vmovdqu64 %%zmm2, (%2)\n\t"
-			: : "r"(a), "r"(b), "r"(dst), "r"(mask)
-			: "zmm0", "zmm1", "zmm2", "k1", "memory");
-	} else {
-		__asm__ volatile(
-			"vmovdqu64 (%0), %%zmm0\n\t"
-			"vmovdqu64 (%1), %%zmm1\n\t"
-			"vmovdqu64 (%2), %%zmm2\n\t"
-			"kmovq %3, %%k1\n\t"
-			"vpaddq %%zmm1, %%zmm0, %%zmm2 %{%%k1%}\n\t"
-			"vmovdqu64 %%zmm2, (%2)\n\t"
-			: : "r"(a), "r"(b), "r"(dst), "r"(mask)
-			: "zmm0", "zmm1", "zmm2", "k1", "memory");
-	}
+	DISPATCH_KREG(BODY_BINARY_MASK_Q, "vpaddq %%zmm1, %%zmm0, %%zmm2 ");
 }
 
 static void exec_vpaddb(const void *a, const void *b, void *dst,
                         uint64_t mask, int zeromask) {
-	if (zeromask) {
-		__asm__ volatile(
-			"vmovdqu64 (%0), %%zmm0\n\t"
-			"vmovdqu64 (%1), %%zmm1\n\t"
-			"kmovq %3, %%k1\n\t"
-			"vpaddb %%zmm1, %%zmm0, %%zmm2 %{%%k1%}%{z%}\n\t"
-			"vmovdqu64 %%zmm2, (%2)\n\t"
-			: : "r"(a), "r"(b), "r"(dst), "r"(mask)
-			: "zmm0", "zmm1", "zmm2", "k1", "memory");
-	} else {
-		__asm__ volatile(
-			"vmovdqu64 (%0), %%zmm0\n\t"
-			"vmovdqu64 (%1), %%zmm1\n\t"
-			"vmovdqu64 (%2), %%zmm2\n\t"
-			"kmovq %3, %%k1\n\t"
-			"vpaddb %%zmm1, %%zmm0, %%zmm2 %{%%k1%}\n\t"
-			"vmovdqu64 %%zmm2, (%2)\n\t"
-			: : "r"(a), "r"(b), "r"(dst), "r"(mask)
-			: "zmm0", "zmm1", "zmm2", "k1", "memory");
-	}
+	DISPATCH_KREG(BODY_BINARY_MASK_Q, "vpaddb %%zmm1, %%zmm0, %%zmm2 ");
 }
 
 /* ---------- logical ---------- */
 
 static void exec_vpxorq(const void *a, const void *b, void *dst,
                         uint64_t mask, int zeromask) {
-	if (zeromask) {
-		__asm__ volatile(
-			"vmovdqu64 (%0), %%zmm0\n\t"
-			"vmovdqu64 (%1), %%zmm1\n\t"
-			"kmovq %3, %%k1\n\t"
-			"vpxorq %%zmm1, %%zmm0, %%zmm2 %{%%k1%}%{z%}\n\t"
-			"vmovdqu64 %%zmm2, (%2)\n\t"
-			: : "r"(a), "r"(b), "r"(dst), "r"(mask)
-			: "zmm0", "zmm1", "zmm2", "k1", "memory");
-	} else {
-		__asm__ volatile(
-			"vmovdqu64 (%0), %%zmm0\n\t"
-			"vmovdqu64 (%1), %%zmm1\n\t"
-			"vmovdqu64 (%2), %%zmm2\n\t"
-			"kmovq %3, %%k1\n\t"
-			"vpxorq %%zmm1, %%zmm0, %%zmm2 %{%%k1%}\n\t"
-			"vmovdqu64 %%zmm2, (%2)\n\t"
-			: : "r"(a), "r"(b), "r"(dst), "r"(mask)
-			: "zmm0", "zmm1", "zmm2", "k1", "memory");
-	}
+	DISPATCH_KREG(BODY_BINARY_MASK_Q, "vpxorq %%zmm1, %%zmm0, %%zmm2 ");
 }
 
 /* ---------- ternary logic, fixed imm8=0xCA ---------- */
@@ -191,80 +214,22 @@ static void exec_vpxorq(const void *a, const void *b, void *dst,
 static void exec_vpternlogq_ca(const void *a, const void *b, void *dst,
                                uint64_t mask, int zeromask) {
 	/* dst = f_{0xCA}(dst, a, b) per-bit. Destructive on zmm2. */
-	if (zeromask) {
-		__asm__ volatile(
-			"vmovdqu64 (%0), %%zmm0\n\t"
-			"vmovdqu64 (%1), %%zmm1\n\t"
-			"vmovdqu64 (%2), %%zmm2\n\t"
-			"kmovq %3, %%k1\n\t"
-			"vpternlogq $0xCA, %%zmm1, %%zmm0, %%zmm2 %{%%k1%}%{z%}\n\t"
-			"vmovdqu64 %%zmm2, (%2)\n\t"
-			: : "r"(a), "r"(b), "r"(dst), "r"(mask)
-			: "zmm0", "zmm1", "zmm2", "k1", "memory");
-	} else {
-		/* Merge-mask: pre-load dst twice is fine (same memory). */
-		__asm__ volatile(
-			"vmovdqu64 (%0), %%zmm0\n\t"
-			"vmovdqu64 (%1), %%zmm1\n\t"
-			"vmovdqu64 (%2), %%zmm2\n\t"
-			"kmovq %3, %%k1\n\t"
-			"vpternlogq $0xCA, %%zmm1, %%zmm0, %%zmm2 %{%%k1%}\n\t"
-			"vmovdqu64 %%zmm2, (%2)\n\t"
-			: : "r"(a), "r"(b), "r"(dst), "r"(mask)
-			: "zmm0", "zmm1", "zmm2", "k1", "memory");
-	}
+	DISPATCH_KREG(BODY_TERNARY_MASK_Q,
+	              "vpternlogq $0xCA, %%zmm1, %%zmm0, %%zmm2 ");
 }
 
 /* ---------- variable shift ---------- */
 
 static void exec_vpsllvq(const void *a, const void *b, void *dst,
                          uint64_t mask, int zeromask) {
-	if (zeromask) {
-		__asm__ volatile(
-			"vmovdqu64 (%0), %%zmm0\n\t"
-			"vmovdqu64 (%1), %%zmm1\n\t"
-			"kmovq %3, %%k1\n\t"
-			"vpsllvq %%zmm1, %%zmm0, %%zmm2 %{%%k1%}%{z%}\n\t"
-			"vmovdqu64 %%zmm2, (%2)\n\t"
-			: : "r"(a), "r"(b), "r"(dst), "r"(mask)
-			: "zmm0", "zmm1", "zmm2", "k1", "memory");
-	} else {
-		__asm__ volatile(
-			"vmovdqu64 (%0), %%zmm0\n\t"
-			"vmovdqu64 (%1), %%zmm1\n\t"
-			"vmovdqu64 (%2), %%zmm2\n\t"
-			"kmovq %3, %%k1\n\t"
-			"vpsllvq %%zmm1, %%zmm0, %%zmm2 %{%%k1%}\n\t"
-			"vmovdqu64 %%zmm2, (%2)\n\t"
-			: : "r"(a), "r"(b), "r"(dst), "r"(mask)
-			: "zmm0", "zmm1", "zmm2", "k1", "memory");
-	}
+	DISPATCH_KREG(BODY_BINARY_MASK_Q, "vpsllvq %%zmm1, %%zmm0, %%zmm2 ");
 }
 
 /* ---------- qword multiply (AVX-512DQ) ---------- */
 
 static void exec_vpmullq(const void *a, const void *b, void *dst,
                          uint64_t mask, int zeromask) {
-	if (zeromask) {
-		__asm__ volatile(
-			"vmovdqu64 (%0), %%zmm0\n\t"
-			"vmovdqu64 (%1), %%zmm1\n\t"
-			"kmovq %3, %%k1\n\t"
-			"vpmullq %%zmm1, %%zmm0, %%zmm2 %{%%k1%}%{z%}\n\t"
-			"vmovdqu64 %%zmm2, (%2)\n\t"
-			: : "r"(a), "r"(b), "r"(dst), "r"(mask)
-			: "zmm0", "zmm1", "zmm2", "k1", "memory");
-	} else {
-		__asm__ volatile(
-			"vmovdqu64 (%0), %%zmm0\n\t"
-			"vmovdqu64 (%1), %%zmm1\n\t"
-			"vmovdqu64 (%2), %%zmm2\n\t"
-			"kmovq %3, %%k1\n\t"
-			"vpmullq %%zmm1, %%zmm0, %%zmm2 %{%%k1%}\n\t"
-			"vmovdqu64 %%zmm2, (%2)\n\t"
-			: : "r"(a), "r"(b), "r"(dst), "r"(mask)
-			: "zmm0", "zmm1", "zmm2", "k1", "memory");
-	}
+	DISPATCH_KREG(BODY_BINARY_MASK_Q, "vpmullq %%zmm1, %%zmm0, %%zmm2 ");
 }
 
 /* ---------- unary: popcnt / lzcnt (AVX-512VPOPCNTDQ / CD) ---------- */
@@ -272,47 +237,13 @@ static void exec_vpmullq(const void *a, const void *b, void *dst,
 static void exec_vpopcntq(const void *a, const void *b, void *dst,
                           uint64_t mask, int zeromask) {
 	(void)b;
-	if (zeromask) {
-		__asm__ volatile(
-			"vmovdqu64 (%0), %%zmm0\n\t"
-			"kmovq %2, %%k1\n\t"
-			"vpopcntq %%zmm0, %%zmm2 %{%%k1%}%{z%}\n\t"
-			"vmovdqu64 %%zmm2, (%1)\n\t"
-			: : "r"(a), "r"(dst), "r"(mask)
-			: "zmm0", "zmm2", "k1", "memory");
-	} else {
-		__asm__ volatile(
-			"vmovdqu64 (%0), %%zmm0\n\t"
-			"vmovdqu64 (%1), %%zmm2\n\t"
-			"kmovq %2, %%k1\n\t"
-			"vpopcntq %%zmm0, %%zmm2 %{%%k1%}\n\t"
-			"vmovdqu64 %%zmm2, (%1)\n\t"
-			: : "r"(a), "r"(dst), "r"(mask)
-			: "zmm0", "zmm2", "k1", "memory");
-	}
+	DISPATCH_KREG(BODY_UNARY_MASK_Q, "vpopcntq %%zmm0, %%zmm2 ");
 }
 
 static void exec_vplzcntq(const void *a, const void *b, void *dst,
                           uint64_t mask, int zeromask) {
 	(void)b;
-	if (zeromask) {
-		__asm__ volatile(
-			"vmovdqu64 (%0), %%zmm0\n\t"
-			"kmovq %2, %%k1\n\t"
-			"vplzcntq %%zmm0, %%zmm2 %{%%k1%}%{z%}\n\t"
-			"vmovdqu64 %%zmm2, (%1)\n\t"
-			: : "r"(a), "r"(dst), "r"(mask)
-			: "zmm0", "zmm2", "k1", "memory");
-	} else {
-		__asm__ volatile(
-			"vmovdqu64 (%0), %%zmm0\n\t"
-			"vmovdqu64 (%1), %%zmm2\n\t"
-			"kmovq %2, %%k1\n\t"
-			"vplzcntq %%zmm0, %%zmm2 %{%%k1%}\n\t"
-			"vmovdqu64 %%zmm2, (%1)\n\t"
-			: : "r"(a), "r"(dst), "r"(mask)
-			: "zmm0", "zmm2", "k1", "memory");
-	}
+	DISPATCH_KREG(BODY_UNARY_MASK_Q, "vplzcntq %%zmm0, %%zmm2 ");
 }
 
 /* ---------- intentional fault executors ----------

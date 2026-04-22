@@ -79,9 +79,10 @@ Flags of note:
 For each iteration, per thread:
 
 1. Picks an instruction class, operand shape (distinct, aliased, or
-   partially overlapping where legal), alignment offset (with 1/8
-   probability biased toward page-straddling), mask pattern (mix of edge
-   cases and random), and zero-vs-merge masking.
+   partially overlapping where legal), a mask register (`k1`..`k7`),
+   alignment offset (with 1/8 probability biased toward page-straddling),
+   mask pattern (mix of edge cases and random), and zero-vs-merge
+   masking.
 2. Writes the iteration descriptor to a per-thread mmap'd state file
    and `msync`s it — this is what survives a kernel panic.
 3. Runs the AVX-512 inline-asm executor against three guard-paged

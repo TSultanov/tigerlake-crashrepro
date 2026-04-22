@@ -168,6 +168,10 @@ static size_t pick_overlap_delta(prng_t *p) {
 	return 1u + (size_t)(prng_u32(p) & 63u);
 }
 
+static uint32_t pick_kreg(prng_t *p) {
+	return INSN_KREG_MIN + (prng_u32(p) % (INSN_KREG_MAX - INSN_KREG_MIN + 1u));
+}
+
 static void choose_operand_layout(prng_t *p, const insn_spec_t *spec,
 	                              const scratch_t *s, uint32_t shape_mask,
 	                              operand_layout_t *layout) {
@@ -403,10 +407,12 @@ int fuzz_run(const fuzz_cfg_t *cfg) {
 		}
 
 		operand_layout_t layout;
+		uint32_t kreg;
 		uint64_t mask  = pick_mask(&p);
 		int zeromask   = prng_bool(&p);
 
 		choose_operand_layout(&p, spec, &s, cfg->shape_mask, &layout);
+		kreg = pick_kreg(&p);
 
 		fill_rand(&p, seed_a, 64);
 		fill_rand(&p, seed_b, 64);
@@ -421,12 +427,14 @@ int fuzz_run(const fuzz_cfg_t *cfg) {
 		uint64_t in_hash = fnv1a64(v_a, 64) ^
 		                   fnv1a64(v_b, 64) ^
 		                   fnv1a64(v_dst_pre, 64);
-		uint32_t flags = (uint32_t)(zeromask ? LOG_FLAG_ZEROMASK : 0u);
+		uint32_t flags = (uint32_t)(zeromask ? LOG_FLAG_ZEROMASK : 0u) |
+		                 LOG_ENCODE_KREG(kreg);
 		log_entry_t *e = logger_begin(&lg, iter, cls, (uint32_t)layout.shape,
 		                              (uint32_t)(mask & 0xffffffffu),
 		                              (uint32_t)(layout.off_dst & 0xffffu),
 		                              /*zmm_dst*/2, flags, in_hash);
 
+		insn_set_kreg(kreg);
 		spec->exec(layout.a_ptr, layout.b_ptr, layout.dst_ptr, mask, zeromask);
 		memcpy(v_dst_post, layout.dst_ptr, 64);
 		uint64_t out_hash = fnv1a64(v_dst_post, 64);

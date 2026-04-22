@@ -132,11 +132,13 @@ log_entry_t *logger_begin(logger_t *lg, uint64_t iter,
 	 * alive without drowning the terminal at ~500k iters/sec/thread. */
 	uint64_t now = e->timestamp_ns;
 	if (lg->verbose || (now - lg->last_print_ns) > 1000000000ull) {
+		uint32_t kreg = LOG_DECODE_KREG(flags);
 		fprintf(stderr,
-			"t%u iter=%llu class=%s shape=%s mask32=%08x off=%u zmm=%u %s in=%016llx\n",
+			"t%u iter=%llu class=%s shape=%s k=k%u mask32=%08x off=%u zmm=%u %s in=%016llx\n",
 			lg->thread_id, (unsigned long long)iter,
 			insn_name(insn_class),
 			operand_shape_name(operand_shape),
+			kreg,
 			mask_pattern, alignment_offset, zmm_dst,
 			(flags & 1u) ? "zmask" : "merge",
 			(unsigned long long)input_hash);
@@ -241,12 +243,13 @@ int logger_dump(const char *path) {
 		uint32_t idx = (lf->ring_pos + i) % lf->ring_len;
 		const log_entry_t *e = &lf->entries[idx];
 		if (e->timestamp_ns == 0) continue;
-		printf("  iter=%-8llu ts=%llu insn=%u shape=%u(%s) k=0x%08x "
+		printf("  iter=%-8llu ts=%llu insn=%u shape=%u(%s) kreg=k%u mask32=0x%08x "
 		       "off=%u zmm=%u flags=0x%x status=%s in=%016llx out=%016llx",
 		       (unsigned long long)e->iter,
 		       (unsigned long long)e->timestamp_ns,
 		       e->insn_class, e->operand_shape,
-		       operand_shape_name(e->operand_shape), e->mask_pattern,
+		       operand_shape_name(e->operand_shape),
+		       LOG_DECODE_KREG(e->flags), e->mask_pattern,
 		       e->alignment_offset, e->zmm_dst, e->flags,
 		       status_str(e->status),
 		       (unsigned long long)e->input_hash,

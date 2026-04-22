@@ -24,6 +24,10 @@
 #define LOG_FLAG_ZEROMASK           (1u << 0)
 #define LOG_FLAG_STORE_VARIANT      (1u << 1)
 #define LOG_FLAG_EXPECTING_FAULT    (1u << 2)  /* op was intentionally aimed at a bad address */
+#define LOG_FLAG_KREG_SHIFT         8u
+#define LOG_FLAG_KREG_MASK          (7u << LOG_FLAG_KREG_SHIFT)
+#define LOG_ENCODE_KREG(kreg)       ((((uint32_t)(kreg)) & 7u) << LOG_FLAG_KREG_SHIFT)
+#define LOG_DECODE_KREG(flags)      ((((uint32_t)(flags)) & LOG_FLAG_KREG_MASK) >> LOG_FLAG_KREG_SHIFT)
 
 /* On-disk entry. Keep small and fixed-layout. Append-only — any new field
  * goes at the end and bumps LOG_VERSION. */

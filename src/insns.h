@@ -33,6 +33,9 @@ typedef enum {
 #define INSN_FAULT_VAR_STORE_U8   5u
 #define INSN_FAULT_VAR_COUNT      6u
 
+#define INSN_KREG_MIN 1u
+#define INSN_KREG_MAX 7u
+
 /* Unified contract for every class:
  *   a_in, b_in: 64 bytes each, aligned-or-not per the test shape.
  *   dst:        64 bytes; on entry holds the "original" destination used
@@ -55,5 +58,7 @@ typedef struct {
 extern const insn_spec_t insn_specs[INSN_CLASS_COUNT];
 
 const char *insn_name(uint32_t class_id);
+void insn_set_kreg(uint32_t kreg);
+uint32_t insn_get_kreg(void);
 
 #endif
