@@ -22,6 +22,7 @@ static void usage(const char *prog) {
 		"  --threads=<N>         worker threads (default: nproc)\n"
 		"  --iters=<N>           iterations per thread, 0=infinite (default: 0)\n"
 		"  --classes=<csv>       restrict to these insn names; default: all\n"
+		"  --shapes=<csv>        restrict to these operand shapes; default: all\n"
 		"  --verify=<on|off>     scalar oracle compare (default: on)\n"
 		"  --churn=<on|off>      AVX-512 frequency/power churn (default: on)\n"
 		"  --faults=<on|off>     AVX-512 loads/stores at intentionally bad\n"
@@ -32,7 +33,8 @@ static void usage(const char *prog) {
 		"  --verbose             echo every iteration to the console\n"
 		"  --logdir=<path>       durable log dir (default: /var/tmp/crashrepro)\n"
 		"  --replay=<path>       dump last state from a log dir and exit\n"
-		"  --list-classes        print instruction classes and exit\n",
+		"  --list-classes        print instruction classes and exit\n"
+		"  --list-shapes         print operand shapes and exit\n",
 		prog);
 }
 
@@ -80,9 +82,44 @@ static uint64_t parse_classes(const char *csv) {
 	return mask;
 }
 
+static uint32_t parse_shapes(const char *csv) {
+	uint32_t mask = 0;
+	const char *p = csv;
+	if (!p || !*p) {
+		fprintf(stderr, "empty shape list\n");
+		exit(2);
+	}
+	while (*p) {
+		const char *q = p;
+		while (*q && *q != ',') q++;
+		size_t n = (size_t)(q - p);
+		int matched = 0;
+		for (uint32_t i = 0; i < OPERAND_SHAPE_COUNT; i++) {
+			const char *name = operand_shape_name(i);
+			if (strlen(name) == n && strncmp(name, p, n) == 0) {
+				mask |= 1u << i;
+				matched = 1;
+				break;
+			}
+		}
+		if (!matched) {
+			fprintf(stderr, "unknown operand shape: %.*s\n", (int)n, p);
+			exit(2);
+		}
+		p = q + (*q ? 1 : 0);
+	}
+	return mask;
+}
+
 static void list_classes(void) {
 	for (uint32_t i = 0; i < INSN_CLASS_COUNT; i++) {
 		printf("  %s\n", insn_specs[i].name);
+	}
+}
+
+static void list_shapes(void) {
+	for (uint32_t i = 0; i < OPERAND_SHAPE_COUNT; i++) {
+		printf("  %s\n", operand_shape_name(i));
 	}
 }
 
@@ -111,6 +148,7 @@ int main(int argc, char **argv) {
 	int threads = 0;
 	uint64_t iters = 0;
 	uint64_t class_mask = 0;
+	uint32_t shape_mask = 0;
 	int verify = 1;
 	int churn = 1;
 	int faults = 1;
@@ -123,6 +161,8 @@ int main(int argc, char **argv) {
 			usage(argv[0]); return 0;
 		} else if (!strcmp(argv[i], "--list-classes")) {
 			list_classes(); return 0;
+		} else if (!strcmp(argv[i], "--list-shapes")) {
+			list_shapes(); return 0;
 		} else if (!strncmp(argv[i], "--seed=", 7)) {
 			seed = strtoull(argv[i] + 7, NULL, 0); have_seed = 1;
 		} else if (!strncmp(argv[i], "--threads=", 10)) {
@@ -131,6 +171,8 @@ int main(int argc, char **argv) {
 			iters = strtoull(argv[i] + 8, NULL, 0);
 		} else if (!strncmp(argv[i], "--classes=", 10)) {
 			class_mask = parse_classes(argv[i] + 10);
+		} else if (!strncmp(argv[i], "--shapes=", 9)) {
+			shape_mask = parse_shapes(argv[i] + 9);
 		} else if (!strncmp(argv[i], "--verify=", 9)) {
 			verify = parse_on_off(argv[i] + 9, 1);
 		} else if (!strncmp(argv[i], "--churn=", 8)) {
@@ -204,6 +246,7 @@ int main(int argc, char **argv) {
 		ws[i].cfg.iters      = iters;
 		ws[i].cfg.logdir     = logdir;
 		ws[i].cfg.class_mask = class_mask;
+		ws[i].cfg.shape_mask = shape_mask;
 		ws[i].cfg.verify     = verify;
 		ws[i].cfg.churn      = churn;
 		ws[i].cfg.faults     = faults;

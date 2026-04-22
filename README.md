@@ -44,6 +44,10 @@ Common runs:
 ./crashrepro --seed=0xDEADBEEFCAFEBABE --threads=1 \
              --classes=vmovdqu64 --churn=off --iters=1000000
 
+# Isolate overlap-only operand layouts while chasing a move crash:
+./crashrepro --threads=1 --classes=vmovdqu64 \
+             --shapes=dst_overlaps_a,a_overlaps_dst --churn=off
+
 # After a whole-system crash, reboot and inspect last-known state:
 ./crashrepro --replay=/var/tmp/cr
 ```
@@ -57,9 +61,14 @@ Flags of note:
   SIGINT / SIGTERM.
 - `--classes=<csv>` — restrict to named classes; `--list-classes` prints
   them.
+- `--shapes=<csv>` — restrict to named operand layouts such as
+   `distinct`, `dst_eq_a`, or `dst_overlaps_a`; `--list-shapes` prints
+   them. Shapes that are impossible for a selected instruction class are
+   skipped.
 - `--verify=on|off` — compare against a scalar oracle (default: on).
 - `--churn=on|off` — interleave AVX-512 frequency/voltage bursts
-  (default: on).
+   using a mix of throughput-heavy, dependency-heavy, and memory-heavy
+   burst profiles (default: on).
 - `--pin` — pin thread *i* to core *i*.
 - `--verbose` — echo every logged iteration to stderr (very chatty;
   without it the logger still emits a ~1/sec per-thread heartbeat so
@@ -69,9 +78,10 @@ Flags of note:
 
 For each iteration, per thread:
 
-1. Picks an instruction class, alignment offset (with 1/8 probability
-   biased toward page-straddling), mask pattern (mix of edge cases and
-   random), and zero-vs-merge masking.
+1. Picks an instruction class, operand shape (distinct, aliased, or
+   partially overlapping where legal), alignment offset (with 1/8
+   probability biased toward page-straddling), mask pattern (mix of edge
+   cases and random), and zero-vs-merge masking.
 2. Writes the iteration descriptor to a per-thread mmap'd state file
    and `msync`s it — this is what survives a kernel panic.
 3. Runs the AVX-512 inline-asm executor against three guard-paged
@@ -81,7 +91,9 @@ For each iteration, per thread:
    cannot cheat) and `memcmp`s the result — silent miscomputation
    shows up here.
 5. Bumps iteration counter; ~1/256 of the time, fires an AVX-512
-   burst-then-gap cycle that forces a frequency/voltage transition.
+   burst-then-gap cycle that forces a frequency/voltage transition. The
+   burst profile is varied between independent ALU pressure, dependent
+   chains, and unaligned `vmovdqu64`-heavy load/store traffic.
 
 On SIGSEGV / SIGILL / SIGBUS / SIGFPE / SIGTRAP: an async-signal-safe
 handler writes signal info, full integer register file, the thread's

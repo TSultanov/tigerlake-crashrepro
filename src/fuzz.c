@@ -32,6 +32,14 @@ typedef struct {
 	size_t   mmap_size;
 } scratch_t;
 
+typedef struct {
+	uint8_t        *a_ptr;
+	uint8_t        *b_ptr;
+	uint8_t        *dst_ptr;
+	operand_shape_t shape;
+	size_t          off_dst;
+} operand_layout_t;
+
 static _Atomic int g_stop = 0;
 
 void fuzz_request_stop(void) { atomic_store_explicit(&g_stop, 1, memory_order_relaxed); }
@@ -113,6 +121,118 @@ static size_t pick_offset(prng_t *p, const insn_spec_t *spec, size_t region_size
 		if (base_off > region_size - 64) base_off = region_size - 64;
 	}
 	return base_off;
+}
+
+
+#define SHAPE_BIT(shape) (1u << (shape))
+
+static uint32_t shape_mask_for_spec(const insn_spec_t *spec) {
+	uint32_t mask = SHAPE_BIT(OPERAND_SHAPE_DISTINCT) |
+	                SHAPE_BIT(OPERAND_SHAPE_DST_EQ_A);
+
+	if (spec->binary) {
+		mask |= SHAPE_BIT(OPERAND_SHAPE_DST_EQ_B) |
+		        SHAPE_BIT(OPERAND_SHAPE_A_EQ_B);
+	}
+	if (!spec->needs_align64) {
+		mask |= SHAPE_BIT(OPERAND_SHAPE_DST_OVERLAPS_A) |
+		        SHAPE_BIT(OPERAND_SHAPE_A_OVERLAPS_DST);
+		if (spec->binary) {
+			mask |= SHAPE_BIT(OPERAND_SHAPE_DST_OVERLAPS_B) |
+			        SHAPE_BIT(OPERAND_SHAPE_B_OVERLAPS_DST);
+		}
+	}
+	return mask;
+}
+
+static operand_shape_t pick_operand_shape(prng_t *p, const insn_spec_t *spec,
+	                                      uint32_t requested_mask) {
+	uint32_t mask = shape_mask_for_spec(spec);
+	uint32_t allowed = requested_mask ? (requested_mask & mask) : mask;
+	uint32_t picks[OPERAND_SHAPE_COUNT];
+	uint32_t count = 0;
+
+	for (uint32_t shape = 0; shape < OPERAND_SHAPE_COUNT; shape++) {
+		if (allowed & SHAPE_BIT(shape)) {
+			picks[count++] = shape;
+		}
+	}
+
+	if (count == 0) {
+		return OPERAND_SHAPE_DISTINCT;
+	}
+	return (operand_shape_t)picks[prng_u32(p) % count];
+}
+
+static size_t pick_overlap_delta(prng_t *p) {
+	return 1u + (size_t)(prng_u32(p) & 63u);
+}
+
+static void choose_operand_layout(prng_t *p, const insn_spec_t *spec,
+	                              const scratch_t *s, uint32_t shape_mask,
+	                              operand_layout_t *layout) {
+	operand_shape_t shape = pick_operand_shape(p, spec, shape_mask);
+	size_t off_a = pick_offset(p, spec, s->region_size);
+	size_t off_b = pick_offset(p, spec, s->region_size);
+	size_t off_dst = pick_offset(p, spec, s->region_size);
+	size_t delta;
+
+	layout->shape = shape;
+	layout->a_ptr = s->a + off_a;
+	layout->b_ptr = s->b + off_b;
+	layout->dst_ptr = s->dst + off_dst;
+	layout->off_dst = off_dst;
+
+	switch (shape) {
+	case OPERAND_SHAPE_DST_EQ_A:
+		off_dst = pick_offset(p, spec, s->region_size);
+		layout->a_ptr = s->dst + off_dst;
+		layout->dst_ptr = layout->a_ptr;
+		layout->off_dst = off_dst;
+		break;
+	case OPERAND_SHAPE_DST_EQ_B:
+		off_dst = pick_offset(p, spec, s->region_size);
+		layout->b_ptr = s->dst + off_dst;
+		layout->dst_ptr = layout->b_ptr;
+		layout->off_dst = off_dst;
+		break;
+	case OPERAND_SHAPE_A_EQ_B:
+		off_a = pick_offset(p, spec, s->region_size);
+		layout->a_ptr = s->a + off_a;
+		layout->b_ptr = layout->a_ptr;
+		break;
+	case OPERAND_SHAPE_DST_OVERLAPS_A:
+		delta = pick_overlap_delta(p);
+		off_a = pick_offset(p, spec, s->region_size - delta);
+		layout->a_ptr = s->dst + off_a;
+		layout->dst_ptr = layout->a_ptr + delta;
+		layout->off_dst = off_a + delta;
+		break;
+	case OPERAND_SHAPE_A_OVERLAPS_DST:
+		delta = pick_overlap_delta(p);
+		off_dst = pick_offset(p, spec, s->region_size - delta);
+		layout->dst_ptr = s->dst + off_dst;
+		layout->a_ptr = layout->dst_ptr + delta;
+		layout->off_dst = off_dst;
+		break;
+	case OPERAND_SHAPE_DST_OVERLAPS_B:
+		delta = pick_overlap_delta(p);
+		off_b = pick_offset(p, spec, s->region_size - delta);
+		layout->b_ptr = s->dst + off_b;
+		layout->dst_ptr = layout->b_ptr + delta;
+		layout->off_dst = off_b + delta;
+		break;
+	case OPERAND_SHAPE_B_OVERLAPS_DST:
+		delta = pick_overlap_delta(p);
+		off_dst = pick_offset(p, spec, s->region_size - delta);
+		layout->dst_ptr = s->dst + off_dst;
+		layout->b_ptr = layout->dst_ptr + delta;
+		layout->off_dst = off_dst;
+		break;
+	case OPERAND_SHAPE_DISTINCT:
+	default:
+		break;
+	}
 }
 
 /* Pick a bad address for the intentional-fault class. Mixes fixed small
@@ -217,8 +337,27 @@ int fuzz_run(const fuzz_cfg_t *cfg) {
 			effective_mask &= ~(1ull << INSN_INTENTIONAL_FAULT);
 		}
 	}
+	for (uint32_t cls = 0; cls < INSN_CLASS_COUNT; cls++) {
+		if ((effective_mask & (1ull << cls)) == 0) continue;
+		if (cls == INSN_INTENTIONAL_FAULT) continue;
+		if (cfg->shape_mask != 0 &&
+		    (shape_mask_for_spec(&insn_specs[cls]) & cfg->shape_mask) == 0) {
+			effective_mask &= ~(1ull << cls);
+		}
+	}
+	if (effective_mask == 0) {
+		fprintf(stderr,
+		        "t%u: no enabled instruction classes are compatible with the selected operand shapes\n",
+		        cfg->thread_id);
+		scratch_free(&s);
+		logger_close(&lg);
+		return -1;
+	}
 
 	/* Verification scratch (stack, 64 bytes each). */
+	uint8_t seed_a[64] __attribute__((aligned(64)));
+	uint8_t seed_b[64] __attribute__((aligned(64)));
+	uint8_t seed_dst[64] __attribute__((aligned(64)));
 	uint8_t v_a[64] __attribute__((aligned(64)));
 	uint8_t v_b[64] __attribute__((aligned(64)));
 	uint8_t v_dst_pre[64]  __attribute__((aligned(64)));
@@ -263,34 +402,33 @@ int fuzz_run(const fuzz_cfg_t *cfg) {
 			goto end_of_iter;
 		}
 
-		size_t off_a   = pick_offset(&p, spec, s.region_size);
-		size_t off_b   = pick_offset(&p, spec, s.region_size);
-		size_t off_dst = pick_offset(&p, spec, s.region_size);
+		operand_layout_t layout;
 		uint64_t mask  = pick_mask(&p);
 		int zeromask   = prng_bool(&p);
 
-		uint8_t *a_ptr   = s.a   + off_a;
-		uint8_t *b_ptr   = s.b   + off_b;
-		uint8_t *dst_ptr = s.dst + off_dst;
+		choose_operand_layout(&p, spec, &s, cfg->shape_mask, &layout);
 
-		fill_rand(&p, v_a, 64);
-		fill_rand(&p, v_b, 64);
-		fill_rand(&p, v_dst_pre, 64);
-		memcpy(a_ptr,   v_a,       64);
-		memcpy(b_ptr,   v_b,       64);
-		memcpy(dst_ptr, v_dst_pre, 64);
+		fill_rand(&p, seed_a, 64);
+		fill_rand(&p, seed_b, 64);
+		fill_rand(&p, seed_dst, 64);
+		memcpy(layout.a_ptr,   seed_a,   64);
+		memcpy(layout.b_ptr,   seed_b,   64);
+		memcpy(layout.dst_ptr, seed_dst, 64);
+		memcpy(v_a,       layout.a_ptr,   64);
+		memcpy(v_b,       layout.b_ptr,   64);
+		memcpy(v_dst_pre, layout.dst_ptr, 64);
 
 		uint64_t in_hash = fnv1a64(v_a, 64) ^
 		                   fnv1a64(v_b, 64) ^
 		                   fnv1a64(v_dst_pre, 64);
 		uint32_t flags = (uint32_t)(zeromask ? LOG_FLAG_ZEROMASK : 0u);
-		log_entry_t *e = logger_begin(&lg, iter, cls, /*shape*/0,
+		log_entry_t *e = logger_begin(&lg, iter, cls, (uint32_t)layout.shape,
 		                              (uint32_t)(mask & 0xffffffffu),
-		                              (uint32_t)(off_dst & 0xffffu),
+		                              (uint32_t)(layout.off_dst & 0xffffu),
 		                              /*zmm_dst*/2, flags, in_hash);
 
-		spec->exec(a_ptr, b_ptr, dst_ptr, mask, zeromask);
-		memcpy(v_dst_post, dst_ptr, 64);
+		spec->exec(layout.a_ptr, layout.b_ptr, layout.dst_ptr, mask, zeromask);
+		memcpy(v_dst_post, layout.dst_ptr, 64);
 		uint64_t out_hash = fnv1a64(v_dst_post, 64);
 
 		uint64_t status = LOG_STATUS_OK;

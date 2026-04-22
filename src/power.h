@@ -5,12 +5,12 @@
 #include "prng.h"
 
 /* Deliberate AVX-512 frequency / voltage churn. Interleaves bursts of
- * heavy zmm-register arithmetic (which drives the AVX-512 frequency
- * license and demands peak VR draw) with microsecond gaps (during which
- * the core clocks back up), so the package is constantly transitioning
- * between AVX-512 and scalar licenses. On Tiger Lake i5-1135G7 those
- * transitions are the most plausible root cause for whole-system crashes
- * induced by user-space AVX-512 code. */
+ * heavy zmm-register arithmetic and memory traffic (which drive the
+ * AVX-512 frequency license and demand peak VR draw) with microsecond
+ * gaps (during which the core clocks back up), so the package is
+ * constantly transitioning between AVX-512 and scalar licenses. On Tiger
+ * Lake i5-1135G7 those transitions are the most plausible root cause for
+ * whole-system crashes induced by user-space AVX-512 code. */
 
 typedef struct {
 	uint64_t bursts;

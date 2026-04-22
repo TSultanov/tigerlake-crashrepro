@@ -1,4 +1,5 @@
 #include "sighandler.h"
+#include "fuzz.h"
 #include "logger.h"
 
 #include <errno.h>
@@ -152,6 +153,7 @@ static void dump_ring(int fd, const logger_t *lg) {
 		safe_u64(fd, e->iter);
 		safe_str(fd, " insn="); safe_u64(fd, e->insn_class);
 		safe_str(fd, " shape="); safe_u64(fd, e->operand_shape);
+		safe_str(fd, "("); safe_str(fd, operand_shape_name(e->operand_shape)); safe_str(fd, ")");
 		safe_str(fd, " mask="); safe_hex64(fd, e->mask_pattern);
 		safe_str(fd, " off="); safe_u64(fd, e->alignment_offset);
 		safe_str(fd, " zmm="); safe_u64(fd, e->zmm_dst);
