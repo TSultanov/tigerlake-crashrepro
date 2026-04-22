@@ -1,6 +1,7 @@
 #include "fuzz.h"
 #include "insns.h"
 #include "logger.h"
+#include "power.h"
 #include "prng.h"
 #include "sighandler.h"
 #include "util.h"
@@ -157,6 +158,7 @@ int fuzz_run(const fuzz_cfg_t *cfg) {
 	uint64_t report_every = 1ull << 16;   /* ~65k iters */
 	uint64_t next_report = report_every;
 	uint64_t last_ns = now_ns();
+	power_stats_t pwr = {0};
 
 	/* Verification scratch (stack, 64 bytes each). */
 	uint8_t v_a[64] __attribute__((aligned(64)));
@@ -224,13 +226,25 @@ int fuzz_run(const fuzz_cfg_t *cfg) {
 		logger_end(&lg, e, out_hash, status);
 
 		iter++;
+
+		/* Frequency/voltage churn: ~1 in 256 iterations, do a burst+gap.
+		 * The burst drives the AVX-512 license and VR transient; the gap
+		 * lets the core clock back up. Tiger Lake's suspected crash sits
+		 * right on this transition, so this is a primary provocation. */
+		if (cfg->churn && (prng_u32(&p) & 0xFFu) == 0) {
+			power_churn_cycle(&p, &pwr);
+		}
+
 		if (!cfg->quiet && iter == next_report) {
 			uint64_t now = now_ns();
 			double elapsed = (double)(now - last_ns) / 1e9;
 			double rate = (double)report_every / elapsed;
-			fprintf(stderr, "t%u iter=%llu rate=%.0f/s mismatches=%llu\n",
-			        cfg->thread_id, (unsigned long long)iter,
-			        rate, (unsigned long long)mismatches);
+			fprintf(stderr,
+				"t%u iter=%llu rate=%.0f/s mismatches=%llu churn_bursts=%llu\n",
+				cfg->thread_id, (unsigned long long)iter,
+				rate,
+				(unsigned long long)mismatches,
+				(unsigned long long)pwr.bursts);
 			last_ns = now;
 			next_report += report_every;
 		}
