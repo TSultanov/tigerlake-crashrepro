@@ -81,7 +81,8 @@ Flags of note:
 - `--verify=on|off` — compare against a scalar oracle (default: on).
 - `--churn=on|off` — interleave AVX-512 frequency/voltage bursts
    using a mix of throughput-heavy, dependency-heavy, and memory-heavy
-   burst profiles (default: on).
+   burst profiles, plus passive sleeps, scalar-active cool-downs, AVX2
+   bridge phases, and rapid multi-burst re-entry trains (default: on).
 - `--pin` — pin thread *i* to core *i*.
 - `--verbose` — echo every logged iteration to stderr (very chatty;
   without it the logger still emits a ~1/sec per-thread heartbeat so
@@ -110,7 +111,9 @@ For each iteration, per thread:
 5. Bumps iteration counter; ~1/256 of the time, fires an AVX-512
    burst-then-gap cycle that forces a frequency/voltage transition. The
    burst profile is varied between independent ALU pressure, dependent
-   chains, and unaligned `vmovdqu64`-heavy load/store traffic.
+   chains, and unaligned `vmovdqu64`-heavy load/store traffic; the gap is
+   varied between passive sleep, active scalar work, AVX2 bridge phases,
+   and rapid re-entry burst trains.
 6. If `--interrupts=on`, a helper thread asynchronously signals workers to
    force extra user-kernel-user context switches and AVX state save/restore
    pressure while the same fuzz cases are executing.

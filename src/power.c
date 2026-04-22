@@ -4,6 +4,9 @@
 #include <stdint.h>
 #include <unistd.h>
 
+#define REENTRY_MIN_US 5u
+#define REENTRY_MAX_US 120u
+
 /* One unit of burst work with no cross-register dependencies, designed to
  * keep both vector pipes busy. Operates on zmm16..zmm27 (EVEX-only
  * encoding) to also exercise the encoder path those registers go through. */
@@ -88,13 +91,73 @@ static inline void burst_kernel(prng_t *p, uint8_t *mem) {
 	}
 }
 
+/* Keep the core busy without issuing vector instructions so the AVX-512
+ * license can decay while the thread remains hot and runnable. */
+static inline void scalar_gap_kernel(uint64_t *state) {
+	*state = (*state * 6364136223846793005ull) + 1442695040888963407ull;
+	*state ^= *state >> 29;
+	__asm__ volatile("" : "+r"(*state) :: "memory");
+}
+
+/* Bridge from AVX-512 into a lighter vector phase before re-entering AVX-512. */
+static inline void avx2_gap_kernel(void) {
+	__asm__ volatile(
+		"vpxor %%ymm8, %%ymm8, %%ymm8\n\t"
+		"vpxor %%ymm9, %%ymm9, %%ymm9\n\t"
+		"vpaddq %%ymm8, %%ymm9, %%ymm10\n\t"
+		"vpxor %%ymm10, %%ymm8, %%ymm11\n\t"
+		"vpaddq %%ymm11, %%ymm10, %%ymm8\n\t"
+		::: "ymm8", "ymm9", "ymm10", "ymm11", "memory"
+	);
+}
+
+static void run_burst_window(prng_t *p, uint8_t *mem, uint64_t burst_us,
+	                         uint64_t *iters_out) {
+	uint64_t end = now_ns() + burst_us * 1000ull;
+	do {
+		burst_kernel(p, mem); burst_kernel(p, mem); burst_kernel(p, mem); burst_kernel(p, mem);
+		burst_kernel(p, mem); burst_kernel(p, mem); burst_kernel(p, mem); burst_kernel(p, mem);
+		if (iters_out) *iters_out += 8;
+	} while (now_ns() < end);
+}
+
+static void run_scalar_gap_window(uint64_t gap_us) {
+	uint64_t state = 0x2545F4914F6CDD1Dull;
+	uint64_t end = now_ns() + gap_us * 1000ull;
+	do {
+		scalar_gap_kernel(&state);
+		scalar_gap_kernel(&state);
+		scalar_gap_kernel(&state);
+		scalar_gap_kernel(&state);
+		scalar_gap_kernel(&state);
+		scalar_gap_kernel(&state);
+		scalar_gap_kernel(&state);
+		scalar_gap_kernel(&state);
+	} while (now_ns() < end);
+	(void)state;
+}
+
+static void run_avx2_gap_window(uint64_t gap_us) {
+	uint64_t end = now_ns() + gap_us * 1000ull;
+	do {
+		avx2_gap_kernel(); avx2_gap_kernel(); avx2_gap_kernel(); avx2_gap_kernel();
+		avx2_gap_kernel(); avx2_gap_kernel(); avx2_gap_kernel(); avx2_gap_kernel();
+	} while (now_ns() < end);
+}
+
+static uint64_t pick_reentry_us(prng_t *p) {
+	return REENTRY_MIN_US + (prng_u32(p) % (REENTRY_MAX_US - REENTRY_MIN_US + 1u));
+}
+
 void power_churn_cycle(prng_t *p, power_stats_t *st) {
 	/* Burst between 50 µs and 2 ms; gap between 10 µs and 200 µs.
 	 * 50 µs is enough to demote the core to the AVX-512 license on Tiger
 	 * Lake; 2 ms exceeds the license-hold window so the core is forced to
-	 * downclock. The gap lets it ramp back up. */
+	 * downclock. The gap lets it ramp back up. We vary whether that gap is
+	 * passive, scalar-active, AVX2-active, or part of a rapid re-entry train. */
 	uint32_t r1 = prng_u32(p);
 	uint32_t r2 = prng_u32(p);
+	uint32_t profile = prng_u32(p) % 4u;
 	uint64_t burst_us = 50u + (r1 % 1950u);
 	uint64_t gap_us   = 10u + (r2 % 190u);
 	uint8_t mem[320] __attribute__((aligned(64)));
@@ -105,16 +168,36 @@ void power_churn_cycle(prng_t *p, power_stats_t *st) {
 	}
 
 	uint64_t start = now_ns();
-	uint64_t end   = start + burst_us * 1000ull;
 	uint64_t iters = 0;
-	do {
-		/* Unroll the kernel a few times so the now_ns() poll is amortised. */
-		burst_kernel(p, mem); burst_kernel(p, mem); burst_kernel(p, mem); burst_kernel(p, mem);
-		burst_kernel(p, mem); burst_kernel(p, mem); burst_kernel(p, mem); burst_kernel(p, mem);
-		iters += 8;
-	} while (now_ns() < end);
-
-	usleep((useconds_t)gap_us);
+	switch (profile) {
+	case 0:
+		/* Baseline: long AVX-512 burst followed by a passive cool-off. */
+		run_burst_window(p, mem, burst_us, &iters);
+		usleep((useconds_t)gap_us);
+		break;
+	case 1:
+		/* Decay the license while keeping the thread active in scalar code,
+		 * then quickly re-enter AVX-512. */
+		run_burst_window(p, mem, burst_us, &iters);
+		run_scalar_gap_window(gap_us);
+		run_burst_window(p, mem, pick_reentry_us(p), &iters);
+		break;
+	case 2:
+		/* Bridge through an AVX2 phase before re-entering AVX-512. */
+		run_burst_window(p, mem, burst_us, &iters);
+		run_avx2_gap_window(gap_us);
+		run_burst_window(p, mem, pick_reentry_us(p), &iters);
+		break;
+	default:
+		/* A train of shorter bursts separated by mixed tiny gaps to hit
+		 * rapid downclock/ramp-up edges repeatedly in one cycle. */
+		run_burst_window(p, mem, burst_us / 2u + 1u, &iters);
+		usleep((useconds_t)(gap_us / 3u + 1u));
+		run_burst_window(p, mem, pick_reentry_us(p), &iters);
+		run_scalar_gap_window(gap_us / 2u + 1u);
+		run_burst_window(p, mem, pick_reentry_us(p), &iters);
+		break;
+	}
 
 	if (st) {
 		st->bursts++;

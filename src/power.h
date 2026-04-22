@@ -6,11 +6,12 @@
 
 /* Deliberate AVX-512 frequency / voltage churn. Interleaves bursts of
  * heavy zmm-register arithmetic and memory traffic (which drive the
- * AVX-512 frequency license and demand peak VR draw) with microsecond
- * gaps (during which the core clocks back up), so the package is
- * constantly transitioning between AVX-512 and scalar licenses. On Tiger
- * Lake i5-1135G7 those transitions are the most plausible root cause for
- * whole-system crashes induced by user-space AVX-512 code. */
+ * AVX-512 frequency license and demand peak VR draw) with several kinds
+ * of short gaps: passive sleeps, active scalar busy loops, AVX2 bridge
+ * phases, and rapid multi-burst re-entry trains. This keeps the package
+ * transitioning between AVX-512, lighter vector, and scalar states. On
+ * Tiger Lake i5-1135G7 those transitions are the most plausible root
+ * cause for whole-system crashes induced by user-space AVX-512 code. */
 
 typedef struct {
 	uint64_t bursts;
