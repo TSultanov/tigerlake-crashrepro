@@ -61,6 +61,9 @@ Flags of note:
 - `--churn=on|off` — interleave AVX-512 frequency/voltage bursts
   (default: on).
 - `--pin` — pin thread *i* to core *i*.
+- `--verbose` — echo every logged iteration to stderr (very chatty;
+  without it the logger still emits a ~1/sec per-thread heartbeat so
+  you can see activity live).
 
 ## What it does
 

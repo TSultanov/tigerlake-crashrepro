@@ -1,4 +1,5 @@
 #include "logger.h"
+#include "insns.h"
 #include "util.h"
 
 #include <dirent.h>
@@ -124,6 +125,21 @@ log_entry_t *logger_begin(logger_t *lg, uint64_t iter,
 	lf->ring_pos = (pos + 1) % lf->ring_len;
 	msync(e, sizeof *e, MS_SYNC);
 	msync(lf, offsetof(log_file_t, entries), MS_SYNC);
+
+	/* Console echo: every iteration when verbose, otherwise a heartbeat
+	 * throttled to ~1/sec per thread so operators can see the tool is
+	 * alive without drowning the terminal at ~500k iters/sec/thread. */
+	uint64_t now = e->timestamp_ns;
+	if (lg->verbose || (now - lg->last_print_ns) > 1000000000ull) {
+		fprintf(stderr,
+			"t%u iter=%llu class=%s mask32=%08x off=%u zmm=%u %s in=%016llx\n",
+			lg->thread_id, (unsigned long long)iter,
+			insn_name(insn_class),
+			mask_pattern, alignment_offset, zmm_dst,
+			(flags & 1u) ? "zmask" : "merge",
+			(unsigned long long)input_hash);
+		lg->last_print_ns = now;
+	}
 	return e;
 }
 

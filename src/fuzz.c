@@ -131,6 +131,7 @@ static uint64_t pick_mask(prng_t *p) {
 int fuzz_run(const fuzz_cfg_t *cfg) {
 	logger_t lg;
 	if (logger_open(&lg, cfg->logdir, cfg->thread_id, cfg->seed) < 0) return -1;
+	lg.verbose = cfg->verbose;
 	sighandler_thread_init(&lg);
 
 	if (cfg->pin_core >= 0) {

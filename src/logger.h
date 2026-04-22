@@ -48,6 +48,8 @@ typedef struct {
 	int           fd;
 	log_file_t   *map;          /* mmap'd LOG_FILE_SIZE bytes */
 	uint32_t      thread_id;
+	int           verbose;      /* 1 = print every iter; 0 = heartbeat ~1/s */
+	uint64_t      last_print_ns;
 } logger_t;
 
 /* Create or truncate the per-thread log file and mmap it. */

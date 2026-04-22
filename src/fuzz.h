@@ -13,6 +13,7 @@ typedef struct {
 	int         churn;         /* frequency/power churn on/off */
 	int         pin_core;      /* -1 = no pin */
 	int         quiet;
+	int         verbose;       /* per-iter console echo from the logger */
 } fuzz_cfg_t;
 
 /* Main worker entry point. Blocks until config->iters completed or until

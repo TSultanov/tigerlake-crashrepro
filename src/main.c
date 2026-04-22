@@ -26,6 +26,7 @@ static void usage(const char *prog) {
 		"  --churn=<on|off>      AVX-512 frequency/power churn (default: on)\n"
 		"  --pin                 pin thread i to core i (default: off)\n"
 		"  --quiet               suppress periodic progress output\n"
+		"  --verbose             echo every iteration to the console\n"
 		"  --logdir=<path>       durable log dir (default: /var/tmp/crashrepro)\n"
 		"  --replay=<path>       dump last state from a log dir and exit\n"
 		"  --list-classes        print instruction classes and exit\n",
@@ -111,6 +112,7 @@ int main(int argc, char **argv) {
 	int churn = 1;
 	int pin = 0;
 	int quiet = 0;
+	int verbose = 0;
 
 	for (int i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
@@ -133,6 +135,8 @@ int main(int argc, char **argv) {
 			pin = 1;
 		} else if (!strcmp(argv[i], "--quiet")) {
 			quiet = 1;
+		} else if (!strcmp(argv[i], "--verbose")) {
+			verbose = 1;
 		} else if (!strncmp(argv[i], "--logdir=", 9)) {
 			logdir = argv[i] + 9;
 		} else if (!strncmp(argv[i], "--replay=", 9)) {
@@ -197,6 +201,7 @@ int main(int argc, char **argv) {
 		ws[i].cfg.churn      = churn;
 		ws[i].cfg.pin_core   = pin ? i : -1;
 		ws[i].cfg.quiet      = quiet;
+		ws[i].cfg.verbose    = verbose;
 		if (pthread_create(&ws[i].th, NULL, worker_entry, &ws[i]) != 0) {
 			fprintf(stderr, "pthread_create thread %d failed\n", i);
 			fuzz_request_stop();
