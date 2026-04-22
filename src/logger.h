@@ -24,6 +24,7 @@
 #define LOG_FLAG_ZEROMASK           (1u << 0)
 #define LOG_FLAG_STORE_VARIANT      (1u << 1)
 #define LOG_FLAG_EXPECTING_FAULT    (1u << 2)  /* op was intentionally aimed at a bad address */
+#define LOG_FLAG_SHARED_DST         (1u << 3)
 #define LOG_FLAG_KREG_SHIFT         8u
 #define LOG_FLAG_KREG_MASK          (7u << LOG_FLAG_KREG_SHIFT)
 #define LOG_ENCODE_KREG(kreg)       ((((uint32_t)(kreg)) & 7u) << LOG_FLAG_KREG_SHIFT)

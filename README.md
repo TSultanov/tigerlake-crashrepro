@@ -40,6 +40,9 @@ Common runs:
 # Full-throttle fuzzing on the target (default):
 ./crashrepro --logdir=/var/tmp/cr
 
+# Force always-shared destination ownership instead of the default alternating mode:
+./crashrepro --logdir=/var/tmp/cr --share-dst=on
+
 # Deterministic replay of one class using a seed we saw crash before:
 ./crashrepro --seed=0xDEADBEEFCAFEBABE --threads=1 \
              --classes=vmovdqu64 --churn=off --iters=1000000
@@ -65,6 +68,10 @@ Flags of note:
    `distinct`, `dst_eq_a`, or `dst_overlaps_a`; `--list-shapes` prints
    them. Shapes that are impossible for a selected instruction class are
    skipped.
+- `--share-dst=<mode>` — destination ownership mode: `off`, `on`, or
+   `alternate` (default). `alternate` runs in deterministic windows of
+   16384 iterations, switching between each thread's private `dst` region
+   and one shared `dst` region across all workers.
 - `--verify=on|off` — compare against a scalar oracle (default: on).
 - `--churn=on|off` — interleave AVX-512 frequency/voltage bursts
    using a mix of throughput-heavy, dependency-heavy, and memory-heavy
@@ -86,11 +93,14 @@ For each iteration, per thread:
 2. Writes the iteration descriptor to a per-thread mmap'd state file
    and `msync`s it — this is what survives a kernel panic.
 3. Runs the AVX-512 inline-asm executor against three guard-paged
-   scratch regions (A, B, dst).
+   scratch regions (A, B, dst). By default, `dst` alternates between a
+   per-thread private region and one shared region used by all workers.
 4. If verification is on, re-runs the operation in a scalar oracle
    (built with `__attribute__((target("no-avx")))` so the compiler
    cannot cheat) and `memcmp`s the result — silent miscomputation
-   shows up here.
+   shows up here. When multiple threads are active, verification is
+   skipped on shared-dst iterations because concurrent writers would make
+   the comparison meaningless.
 5. Bumps iteration counter; ~1/256 of the time, fires an AVX-512
    burst-then-gap cycle that forces a frequency/voltage transition. The
    burst profile is varied between independent ALU pressure, dependent

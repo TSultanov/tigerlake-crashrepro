@@ -32,13 +32,30 @@ static inline const char *operand_shape_name(uint32_t shape) {
 	}
 }
 
+typedef enum {
+	SHARE_DST_OFF = 0,
+	SHARE_DST_ON = 1,
+	SHARE_DST_ALTERNATE = 2,
+} share_dst_mode_t;
+
+static inline const char *share_dst_mode_name(share_dst_mode_t mode) {
+	switch (mode) {
+	case SHARE_DST_OFF:       return "off";
+	case SHARE_DST_ON:        return "on";
+	case SHARE_DST_ALTERNATE: return "alternate";
+	default:                  return "unknown";
+	}
+}
+
 typedef struct {
 	uint32_t    thread_id;
+	uint32_t    thread_count;
 	uint64_t    seed;          /* per-thread seed = base_seed ^ thread_id */
 	uint64_t    iters;         /* 0 = infinite */
 	const char *logdir;
 	uint64_t    class_mask;    /* bit i set => class i enabled; 0 => all */
 	uint32_t    shape_mask;    /* bit i set => operand shape i enabled; 0 => all */
+	share_dst_mode_t share_dst_mode;
 	int         verify;        /* scalar oracle compare on/off */
 	int         churn;         /* frequency/power churn on/off */
 	int         faults;        /* intentional AVX-512 bad-address faults on/off */

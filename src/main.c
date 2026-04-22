@@ -23,6 +23,7 @@ static void usage(const char *prog) {
 		"  --iters=<N>           iterations per thread, 0=infinite (default: 0)\n"
 		"  --classes=<csv>       restrict to these insn names; default: all\n"
 		"  --shapes=<csv>        restrict to these operand shapes; default: all\n"
+		"  --share-dst=<mode>    dst ownership mode: off|on|alternate (default: alternate)\n"
 		"  --verify=<on|off>     scalar oracle compare (default: on)\n"
 		"  --churn=<on|off>      AVX-512 frequency/power churn (default: on)\n"
 		"  --faults=<on|off>     AVX-512 loads/stores at intentionally bad\n"
@@ -54,6 +55,21 @@ static int parse_on_off(const char *v, int dflt) {
 	if (!strcmp(v, "on") || !strcmp(v, "1") || !strcmp(v, "yes")) return 1;
 	if (!strcmp(v, "off") || !strcmp(v, "0") || !strcmp(v, "no")) return 0;
 	fprintf(stderr, "bad on/off value: %s\n", v);
+	exit(2);
+}
+
+static share_dst_mode_t parse_share_dst_mode(const char *v) {
+	if (!v || !*v) return SHARE_DST_ALTERNATE;
+	if (!strcmp(v, "off") || !strcmp(v, "0") || !strcmp(v, "no")) {
+		return SHARE_DST_OFF;
+	}
+	if (!strcmp(v, "on") || !strcmp(v, "1") || !strcmp(v, "yes")) {
+		return SHARE_DST_ON;
+	}
+	if (!strcmp(v, "alternate") || !strcmp(v, "alt") || !strcmp(v, "mixed")) {
+		return SHARE_DST_ALTERNATE;
+	}
+	fprintf(stderr, "bad share-dst mode: %s\n", v);
 	exit(2);
 }
 
@@ -149,6 +165,7 @@ int main(int argc, char **argv) {
 	uint64_t iters = 0;
 	uint64_t class_mask = 0;
 	uint32_t shape_mask = 0;
+	share_dst_mode_t share_dst_mode = SHARE_DST_ALTERNATE;
 	int verify = 1;
 	int churn = 1;
 	int faults = 1;
@@ -173,6 +190,8 @@ int main(int argc, char **argv) {
 			class_mask = parse_classes(argv[i] + 10);
 		} else if (!strncmp(argv[i], "--shapes=", 9)) {
 			shape_mask = parse_shapes(argv[i] + 9);
+		} else if (!strncmp(argv[i], "--share-dst=", 12)) {
+			share_dst_mode = parse_share_dst_mode(argv[i] + 12);
 		} else if (!strncmp(argv[i], "--verify=", 9)) {
 			verify = parse_on_off(argv[i] + 9, 1);
 		} else if (!strncmp(argv[i], "--churn=", 8)) {
@@ -202,7 +221,6 @@ int main(int argc, char **argv) {
 		long n = sysconf(_SC_NPROCESSORS_ONLN);
 		threads = (n > 0) ? (int)n : 1;
 	}
-
 	cpuinfo_t ci;
 	cpuinfo_detect(&ci);
 	cpuinfo_print(&ci);
@@ -216,10 +234,10 @@ int main(int argc, char **argv) {
 			"the target crash.\n");
 	}
 
-	printf("seed=0x%016llx threads=%d iters=%llu verify=%s churn=%s faults=%s pin=%d logdir=%s\n",
+	printf("seed=0x%016llx threads=%d iters=%llu verify=%s churn=%s faults=%s share_dst=%s pin=%d logdir=%s\n",
 	       (unsigned long long)seed, threads, (unsigned long long)iters,
 	       verify ? "on" : "off", churn ? "on" : "off",
-	       faults ? "on" : "off", pin, logdir);
+	       faults ? "on" : "off", share_dst_mode_name(share_dst_mode), pin, logdir);
 
 	if (sighandler_install_global(logdir) < 0) {
 		fprintf(stderr, "error: cannot install crash handlers: %s\n",
@@ -242,11 +260,13 @@ int main(int argc, char **argv) {
 
 	for (int i = 0; i < threads; i++) {
 		ws[i].cfg.thread_id  = (uint32_t)i;
+		ws[i].cfg.thread_count = (uint32_t)threads;
 		ws[i].cfg.seed       = seed ^ ((uint64_t)i * 0x9E3779B97F4A7C15ull);
 		ws[i].cfg.iters      = iters;
 		ws[i].cfg.logdir     = logdir;
 		ws[i].cfg.class_mask = class_mask;
 		ws[i].cfg.shape_mask = shape_mask;
+		ws[i].cfg.share_dst_mode = share_dst_mode;
 		ws[i].cfg.verify     = verify;
 		ws[i].cfg.churn      = churn;
 		ws[i].cfg.faults     = faults;

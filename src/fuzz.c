@@ -7,6 +7,7 @@
 #include "util.h"
 
 #include <errno.h>
+#include <pthread.h>
 #include <sched.h>
 #include <setjmp.h>
 #include <stdatomic.h>
@@ -19,6 +20,7 @@
 
 #define PAGE_SIZE  4096u
 #define PLAY_SIZE  (128u * 1024u)   /* per-region play area */
+#define SHARE_DST_PHASE_ITERS (1ull << 14)
 
 /* Layout for each worker's scratch: three regions (A, B, dst) each sandwiched
  * between PROT_NONE guard pages so walking off the end is a clean SIGSEGV
@@ -26,10 +28,12 @@
 typedef struct {
 	uint8_t *a;
 	uint8_t *b;
-	uint8_t *dst;
+	uint8_t *dst_private;
+	uint8_t *dst_shared;
 	size_t   region_size;
 	void    *mmap_base;
 	size_t   mmap_size;
+	int      has_shared_dst;
 } scratch_t;
 
 typedef struct {
@@ -40,12 +44,72 @@ typedef struct {
 	size_t          off_dst;
 } operand_layout_t;
 
+static void scratch_free(scratch_t *s);
+
 static _Atomic int g_stop = 0;
+
+typedef struct {
+	pthread_mutex_t mu;
+	uint8_t        *dst;
+	void           *mmap_base;
+	size_t          mmap_size;
+	uint32_t        refs;
+} shared_dst_state_t;
+
+static shared_dst_state_t g_shared_dst = {
+	.mu = PTHREAD_MUTEX_INITIALIZER,
+};
 
 void fuzz_request_stop(void) { atomic_store_explicit(&g_stop, 1, memory_order_relaxed); }
 int  fuzz_should_stop(void)  { return atomic_load_explicit(&g_stop, memory_order_relaxed); }
 
-static int scratch_alloc(scratch_t *s) {
+static int shared_dst_acquire(uint8_t **dst_out) {
+	int rc = -1;
+	if (pthread_mutex_lock(&g_shared_dst.mu) != 0) return -1;
+	if (g_shared_dst.refs == 0) {
+		size_t total = PAGE_SIZE * 2 + PLAY_SIZE;
+		void *base = mmap(NULL, total, PROT_READ | PROT_WRITE,
+		                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (base == MAP_FAILED) goto out;
+		uint8_t *p = (uint8_t *)base;
+		if (mprotect(p, PAGE_SIZE, PROT_NONE) < 0) {
+			munmap(base, total);
+			goto out;
+		}
+		p += PAGE_SIZE;
+		g_shared_dst.dst = p;
+		p += PLAY_SIZE;
+		if (mprotect(p, PAGE_SIZE, PROT_NONE) < 0) {
+			munmap(base, total);
+			g_shared_dst.dst = NULL;
+			goto out;
+		}
+		g_shared_dst.mmap_base = base;
+		g_shared_dst.mmap_size = total;
+	}
+	g_shared_dst.refs++;
+	*dst_out = g_shared_dst.dst;
+	rc = 0;
+out:
+	(void)pthread_mutex_unlock(&g_shared_dst.mu);
+	return rc;
+}
+
+static void shared_dst_release(void) {
+	if (pthread_mutex_lock(&g_shared_dst.mu) != 0) return;
+	if (g_shared_dst.refs > 0) {
+		g_shared_dst.refs--;
+		if (g_shared_dst.refs == 0 && g_shared_dst.mmap_base) {
+			munmap(g_shared_dst.mmap_base, g_shared_dst.mmap_size);
+			g_shared_dst.dst = NULL;
+			g_shared_dst.mmap_base = NULL;
+			g_shared_dst.mmap_size = 0;
+		}
+	}
+	(void)pthread_mutex_unlock(&g_shared_dst.mu);
+}
+
+static int scratch_alloc_private(scratch_t *s) {
 	/* [guard][A][guard][B][guard][DST][guard] */
 	size_t total = PAGE_SIZE * 4 + PLAY_SIZE * 3;
 	void *base = mmap(NULL, total, PROT_READ | PROT_WRITE,
@@ -61,21 +125,50 @@ static int scratch_alloc(scratch_t *s) {
 	s->b = p; p += PLAY_SIZE;
 	if (mprotect(p, PAGE_SIZE, PROT_NONE) < 0) goto fail;
 	p += PAGE_SIZE;
-	s->dst = p; p += PLAY_SIZE;
+	s->dst_private = p; p += PLAY_SIZE;
 	if (mprotect(p, PAGE_SIZE, PROT_NONE) < 0) goto fail;
 
 	s->region_size = PLAY_SIZE;
 	s->mmap_base = base;
 	s->mmap_size = total;
+	s->has_shared_dst = 0;
 	return 0;
 fail:
 	munmap(base, total);
 	return -1;
 }
 
+static int scratch_alloc(scratch_t *s, share_dst_mode_t share_mode) {
+	memset(s, 0, sizeof *s);
+	if (scratch_alloc_private(s) < 0) return -1;
+	if (share_mode != SHARE_DST_OFF) {
+		if (shared_dst_acquire(&s->dst_shared) < 0) {
+			scratch_free(s);
+			return -1;
+		}
+		s->has_shared_dst = 1;
+	}
+	return 0;
+}
+
 static void scratch_free(scratch_t *s) {
+	if (s->has_shared_dst) shared_dst_release();
 	if (s->mmap_base) munmap(s->mmap_base, s->mmap_size);
 	memset(s, 0, sizeof *s);
+}
+
+static int use_shared_dst_for_iter(const fuzz_cfg_t *cfg, const scratch_t *s,
+	                               uint64_t iter) {
+	if (!s->has_shared_dst) return 0;
+	switch (cfg->share_dst_mode) {
+	case SHARE_DST_ON:
+		return 1;
+	case SHARE_DST_ALTERNATE:
+		return (int)(((iter / SHARE_DST_PHASE_ITERS) & 1ull) != 0);
+	case SHARE_DST_OFF:
+	default:
+		return 0;
+	}
 }
 
 /* Fill n bytes pseudo-randomly from p's state. */
@@ -173,8 +266,8 @@ static uint32_t pick_kreg(prng_t *p) {
 }
 
 static void choose_operand_layout(prng_t *p, const insn_spec_t *spec,
-	                              const scratch_t *s, uint32_t shape_mask,
-	                              operand_layout_t *layout) {
+	                              const scratch_t *s, uint8_t *dst_base,
+	                              uint32_t shape_mask, operand_layout_t *layout) {
 	operand_shape_t shape = pick_operand_shape(p, spec, shape_mask);
 	size_t off_a = pick_offset(p, spec, s->region_size);
 	size_t off_b = pick_offset(p, spec, s->region_size);
@@ -184,19 +277,19 @@ static void choose_operand_layout(prng_t *p, const insn_spec_t *spec,
 	layout->shape = shape;
 	layout->a_ptr = s->a + off_a;
 	layout->b_ptr = s->b + off_b;
-	layout->dst_ptr = s->dst + off_dst;
+	layout->dst_ptr = dst_base + off_dst;
 	layout->off_dst = off_dst;
 
 	switch (shape) {
 	case OPERAND_SHAPE_DST_EQ_A:
 		off_dst = pick_offset(p, spec, s->region_size);
-		layout->a_ptr = s->dst + off_dst;
+		layout->a_ptr = dst_base + off_dst;
 		layout->dst_ptr = layout->a_ptr;
 		layout->off_dst = off_dst;
 		break;
 	case OPERAND_SHAPE_DST_EQ_B:
 		off_dst = pick_offset(p, spec, s->region_size);
-		layout->b_ptr = s->dst + off_dst;
+		layout->b_ptr = dst_base + off_dst;
 		layout->dst_ptr = layout->b_ptr;
 		layout->off_dst = off_dst;
 		break;
@@ -208,28 +301,28 @@ static void choose_operand_layout(prng_t *p, const insn_spec_t *spec,
 	case OPERAND_SHAPE_DST_OVERLAPS_A:
 		delta = pick_overlap_delta(p);
 		off_a = pick_offset(p, spec, s->region_size - delta);
-		layout->a_ptr = s->dst + off_a;
+		layout->a_ptr = dst_base + off_a;
 		layout->dst_ptr = layout->a_ptr + delta;
 		layout->off_dst = off_a + delta;
 		break;
 	case OPERAND_SHAPE_A_OVERLAPS_DST:
 		delta = pick_overlap_delta(p);
 		off_dst = pick_offset(p, spec, s->region_size - delta);
-		layout->dst_ptr = s->dst + off_dst;
+		layout->dst_ptr = dst_base + off_dst;
 		layout->a_ptr = layout->dst_ptr + delta;
 		layout->off_dst = off_dst;
 		break;
 	case OPERAND_SHAPE_DST_OVERLAPS_B:
 		delta = pick_overlap_delta(p);
 		off_b = pick_offset(p, spec, s->region_size - delta);
-		layout->b_ptr = s->dst + off_b;
+		layout->b_ptr = dst_base + off_b;
 		layout->dst_ptr = layout->b_ptr + delta;
 		layout->off_dst = off_b + delta;
 		break;
 	case OPERAND_SHAPE_B_OVERLAPS_DST:
 		delta = pick_overlap_delta(p);
 		off_dst = pick_offset(p, spec, s->region_size - delta);
-		layout->dst_ptr = s->dst + off_dst;
+		layout->dst_ptr = dst_base + off_dst;
 		layout->b_ptr = layout->dst_ptr + delta;
 		layout->off_dst = off_dst;
 		break;
@@ -266,16 +359,16 @@ static uint64_t pick_bad_addr(prng_t *p, const scratch_t *s) {
 		return 0xffff000000000000ull | (prng_u64(p) & 0x0000ffffffffffc0ull);
 	default: {
 		/* Target one of the three PROT_NONE guard pages. Guards sit at
-		 * s->a - PAGE_SIZE, s->b - PAGE_SIZE, s->dst - PAGE_SIZE, and
-		 * the trailing one at s->dst + region_size. */
+		 * s->a - PAGE_SIZE, s->b - PAGE_SIZE, s->dst_private - PAGE_SIZE,
+		 * and the trailing one at s->dst_private + region_size. */
 		static const int which_max = 4;
 		int which = (int)(prng_u32(p) % (uint32_t)which_max);
 		uintptr_t base;
 		switch (which) {
 		case 0:  base = (uintptr_t)s->a - PAGE_SIZE; break;
 		case 1:  base = (uintptr_t)s->b - PAGE_SIZE; break;
-		case 2:  base = (uintptr_t)s->dst - PAGE_SIZE; break;
-		default: base = (uintptr_t)s->dst + s->region_size; break;
+		case 2:  base = (uintptr_t)s->dst_private - PAGE_SIZE; break;
+		default: base = (uintptr_t)s->dst_private + s->region_size; break;
 		}
 		return (uint64_t)(base + (prng_u32(p) % (PAGE_SIZE - 64)));
 	}
@@ -313,7 +406,7 @@ int fuzz_run(const fuzz_cfg_t *cfg) {
 	}
 
 	scratch_t s;
-	if (scratch_alloc(&s) < 0) {
+	if (scratch_alloc(&s, cfg->share_dst_mode) < 0) {
 		fprintf(stderr, "t%u: scratch_alloc failed\n", cfg->thread_id);
 		logger_close(&lg);
 		return -1;
@@ -408,10 +501,14 @@ int fuzz_run(const fuzz_cfg_t *cfg) {
 
 		operand_layout_t layout;
 		uint32_t kreg;
+		int use_shared_dst;
+		uint8_t *dst_base;
 		uint64_t mask  = pick_mask(&p);
 		int zeromask   = prng_bool(&p);
 
-		choose_operand_layout(&p, spec, &s, cfg->shape_mask, &layout);
+		use_shared_dst = use_shared_dst_for_iter(cfg, &s, iter);
+		dst_base = use_shared_dst ? s.dst_shared : s.dst_private;
+		choose_operand_layout(&p, spec, &s, dst_base, cfg->shape_mask, &layout);
 		kreg = pick_kreg(&p);
 
 		fill_rand(&p, seed_a, 64);
@@ -428,6 +525,7 @@ int fuzz_run(const fuzz_cfg_t *cfg) {
 		                   fnv1a64(v_b, 64) ^
 		                   fnv1a64(v_dst_pre, 64);
 		uint32_t flags = (uint32_t)(zeromask ? LOG_FLAG_ZEROMASK : 0u) |
+		                 (uint32_t)(use_shared_dst ? LOG_FLAG_SHARED_DST : 0u) |
 		                 LOG_ENCODE_KREG(kreg);
 		log_entry_t *e = logger_begin(&lg, iter, cls, (uint32_t)layout.shape,
 		                              (uint32_t)(mask & 0xffffffffu),
@@ -440,7 +538,7 @@ int fuzz_run(const fuzz_cfg_t *cfg) {
 		uint64_t out_hash = fnv1a64(v_dst_post, 64);
 
 		uint64_t status = LOG_STATUS_OK;
-		if (cfg->verify) {
+		if (cfg->verify && (!use_shared_dst || cfg->thread_count <= 1)) {
 			memcpy(v_dst_oracle, v_dst_pre, 64);
 			spec->oracle(v_a, v_b, v_dst_oracle, mask, zeromask);
 			if (memcmp(v_dst_oracle, v_dst_post, 64) != 0) {
