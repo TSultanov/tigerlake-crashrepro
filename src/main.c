@@ -7,6 +7,7 @@
 #include "cpuid.h"
 #include "logger.h"
 #include "prng.h"
+#include "sighandler.h"
 
 static void usage(const char *prog) {
 	fprintf(stderr,
@@ -76,9 +77,15 @@ int main(int argc, char **argv) {
 	printf("seed=0x%016llx logdir=%s\n",
 	       (unsigned long long)seed, logdir);
 
+	if (sighandler_install_global(logdir) < 0) {
+		fprintf(stderr, "error: cannot install signal handlers\n");
+		return 1;
+	}
+
 	/* Smoke test: open a logger, write a few dummy entries, close, replay. */
 	logger_t lg;
 	if (logger_open(&lg, logdir, 0, seed) < 0) return 1;
+	sighandler_thread_init(&lg);
 
 	prng_t p;
 	prng_seed(&p, seed);
