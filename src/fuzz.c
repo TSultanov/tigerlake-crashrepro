@@ -8,6 +8,7 @@
 
 #include <errno.h>
 #include <sched.h>
+#include <setjmp.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -114,6 +115,49 @@ static size_t pick_offset(prng_t *p, const insn_spec_t *spec, size_t region_size
 	return base_off;
 }
 
+/* Pick a bad address for the intentional-fault class. Mixes fixed small
+ * addresses that match real crash triage (0x14c, 0x1500), canonical-hole
+ * and kernel-space addresses that trigger #GP, random small values, random
+ * high-canonical values, and the PROT_NONE guard pages around the scratch
+ * regions. */
+static uint64_t pick_bad_addr(prng_t *p, const scratch_t *s) {
+	static const uint64_t fixed_small[] = {
+		0x0ull, 0x8ull, 0x14ull, 0x14cull, 0x1500ull, 0x10000ull,
+	};
+	static const uint64_t canonical_hole[] = {
+		0xffffffffffffffc0ull,
+		0xffff800000000000ull,
+		0x0000800000000000ull,
+	};
+
+	uint32_t bucket = prng_u32(p) % 5;
+	switch (bucket) {
+	case 0:
+		return fixed_small[prng_u32(p) % (sizeof fixed_small / sizeof fixed_small[0])];
+	case 1:
+		return canonical_hole[prng_u32(p) % (sizeof canonical_hole / sizeof canonical_hole[0])];
+	case 2:
+		return (uint64_t)(prng_u32(p) & 0xffffu);
+	case 3:
+		return 0xffff000000000000ull | (prng_u64(p) & 0x0000ffffffffffc0ull);
+	default: {
+		/* Target one of the three PROT_NONE guard pages. Guards sit at
+		 * s->a - PAGE_SIZE, s->b - PAGE_SIZE, s->dst - PAGE_SIZE, and
+		 * the trailing one at s->dst + region_size. */
+		static const int which_max = 4;
+		int which = (int)(prng_u32(p) % (uint32_t)which_max);
+		uintptr_t base;
+		switch (which) {
+		case 0:  base = (uintptr_t)s->a - PAGE_SIZE; break;
+		case 1:  base = (uintptr_t)s->b - PAGE_SIZE; break;
+		case 2:  base = (uintptr_t)s->dst - PAGE_SIZE; break;
+		default: base = (uintptr_t)s->dst + s->region_size; break;
+		}
+		return (uint64_t)(base + (prng_u32(p) % (PAGE_SIZE - 64)));
+	}
+	}
+}
+
 /* Pick an interesting mask pattern. Mix of random and edge-case values
  * (all-ones, all-zeros, alternating, single-bit). */
 static uint64_t pick_mask(prng_t *p) {
@@ -155,11 +199,24 @@ int fuzz_run(const fuzz_cfg_t *cfg) {
 	prng_seed(&p, cfg->seed);
 
 	uint64_t mismatches = 0;
+	uint64_t expected_faults = 0;
+	uint64_t missed_faults = 0;
 	uint64_t iter = 0;
 	uint64_t report_every = 1ull << 16;   /* ~65k iters */
 	uint64_t next_report = report_every;
 	uint64_t last_ns = now_ns();
 	power_stats_t pwr = {0};
+
+	/* Build the effective class mask. If the user gave one explicitly we
+	 * use it verbatim; otherwise all classes are eligible but the
+	 * intentional-fault class is opt-in via cfg->faults. */
+	uint64_t effective_mask = cfg->class_mask;
+	if (effective_mask == 0) {
+		effective_mask = (1ull << INSN_CLASS_COUNT) - 1ull;
+		if (!cfg->faults) {
+			effective_mask &= ~(1ull << INSN_INTENTIONAL_FAULT);
+		}
+	}
 
 	/* Verification scratch (stack, 64 bytes each). */
 	uint8_t v_a[64] __attribute__((aligned(64)));
@@ -169,15 +226,42 @@ int fuzz_run(const fuzz_cfg_t *cfg) {
 	uint8_t v_dst_oracle[64] __attribute__((aligned(64)));
 
 	while (!fuzz_should_stop() && (cfg->iters == 0 || iter < cfg->iters)) {
-		/* Choose class, honouring optional bitmask filter. */
+		/* Choose class, honouring the effective mask computed above. */
 		uint32_t cls;
-		if (cfg->class_mask) {
-			do { cls = prng_u32(&p) % INSN_CLASS_COUNT; }
-			while ((cfg->class_mask & (1ull << cls)) == 0);
-		} else {
-			cls = prng_u32(&p) % INSN_CLASS_COUNT;
-		}
+		do { cls = prng_u32(&p) % INSN_CLASS_COUNT; }
+		while ((effective_mask & (1ull << cls)) == 0);
 		const insn_spec_t *spec = &insn_specs[cls];
+
+		if (cls == INSN_INTENTIONAL_FAULT) {
+			uint64_t bad = pick_bad_addr(&p, &s);
+			uint32_t variant = prng_u32(&p) % INSN_FAULT_VAR_COUNT;
+			log_entry_t *e = logger_begin_fault(&lg, iter, cls, /*flags*/0,
+			                                    bad, variant);
+			if (sigsetjmp(sighandler_recovery_buf, 1) == 0) {
+				sighandler_arm_expected_fault(bad, e);
+				/* Dispatch; handler should longjmp back before this
+				 * returns. If the address happens to be mapped (unlikely
+				 * — guards are PROT_NONE, canonical-hole values #GP), we
+				 * reach the line below. */
+				spec->exec((const void *)(uintptr_t)bad, NULL, NULL,
+				           (uint64_t)variant, 0);
+				sighandler_disarm_expected_fault();
+				missed_faults++;
+				logger_end(&lg, e, 0, LOG_STATUS_FAULT_MISSED);
+				if (!cfg->quiet) {
+					fprintf(stderr,
+						"t%u iter=%llu class=%s FAULT_MISSED target=0x%016llx variant=%u\n",
+						cfg->thread_id, (unsigned long long)iter,
+						spec->name, (unsigned long long)bad, variant);
+				}
+			} else {
+				/* Recovered via siglongjmp. The handler already set
+				 * status=EXPECTED_FAULT and msync'd the entry. */
+				expected_faults++;
+			}
+			iter++;
+			goto end_of_iter;
+		}
 
 		size_t off_a   = pick_offset(&p, spec, s.region_size);
 		size_t off_b   = pick_offset(&p, spec, s.region_size);
@@ -199,7 +283,7 @@ int fuzz_run(const fuzz_cfg_t *cfg) {
 		uint64_t in_hash = fnv1a64(v_a, 64) ^
 		                   fnv1a64(v_b, 64) ^
 		                   fnv1a64(v_dst_pre, 64);
-		uint32_t flags = (uint32_t)(zeromask ? 1u : 0u);
+		uint32_t flags = (uint32_t)(zeromask ? LOG_FLAG_ZEROMASK : 0u);
 		log_entry_t *e = logger_begin(&lg, iter, cls, /*shape*/0,
 		                              (uint32_t)(mask & 0xffffffffu),
 		                              (uint32_t)(off_dst & 0xffffu),
@@ -209,13 +293,13 @@ int fuzz_run(const fuzz_cfg_t *cfg) {
 		memcpy(v_dst_post, dst_ptr, 64);
 		uint64_t out_hash = fnv1a64(v_dst_post, 64);
 
-		uint64_t status = 1;
+		uint64_t status = LOG_STATUS_OK;
 		if (cfg->verify) {
 			memcpy(v_dst_oracle, v_dst_pre, 64);
 			spec->oracle(v_a, v_b, v_dst_oracle, mask, zeromask);
 			if (memcmp(v_dst_oracle, v_dst_post, 64) != 0) {
 				mismatches++;
-				status = 2;
+				status = LOG_STATUS_MISMATCH;
 				if (!cfg->quiet) {
 					fprintf(stderr,
 						"t%u iter=%llu class=%s MISMATCH (mask=0x%016llx z=%d)\n",
@@ -227,6 +311,7 @@ int fuzz_run(const fuzz_cfg_t *cfg) {
 		logger_end(&lg, e, out_hash, status);
 
 		iter++;
+	end_of_iter: ;
 
 		/* Frequency/voltage churn: ~1 in 256 iterations, do a burst+gap.
 		 * The burst drives the AVX-512 license and VR transient; the gap
@@ -241,11 +326,13 @@ int fuzz_run(const fuzz_cfg_t *cfg) {
 			double elapsed = (double)(now - last_ns) / 1e9;
 			double rate = (double)report_every / elapsed;
 			fprintf(stderr,
-				"t%u iter=%llu rate=%.0f/s mismatches=%llu churn_bursts=%llu\n",
+				"t%u iter=%llu rate=%.0f/s mismatches=%llu churn_bursts=%llu expected_faults=%llu missed_faults=%llu\n",
 				cfg->thread_id, (unsigned long long)iter,
 				rate,
 				(unsigned long long)mismatches,
-				(unsigned long long)pwr.bursts);
+				(unsigned long long)pwr.bursts,
+				(unsigned long long)expected_faults,
+				(unsigned long long)missed_faults);
 			last_ns = now;
 			next_report += report_every;
 		}

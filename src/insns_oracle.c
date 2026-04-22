@@ -235,3 +235,11 @@ NOVEC void oracle_vplzcntq(const void *a_in, const void *b_in, void *dst,
 		}
 	}
 }
+
+/* No-op oracle for the intentional-fault class: the executor is expected
+ * to trap, and on recovery the dst buffer is left untouched — so the
+ * oracle must leave it untouched too. */
+NOVEC void oracle_intentional_fault(const void *a_in, const void *b_in,
+                                    void *dst, uint64_t m, int zeromask) {
+	(void)a_in; (void)b_in; (void)dst; (void)m; (void)zeromask;
+}

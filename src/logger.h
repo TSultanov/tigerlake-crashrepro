@@ -9,11 +9,24 @@
  * per thread from disk on reboot. */
 
 #define LOG_MAGIC "CRSHRPR\0"
-#define LOG_VERSION 1u
+#define LOG_VERSION 2u
 #define LOG_RING_LEN 64u
 #define LOG_FILE_SIZE 8192u  /* two pages; header + 64 entries won't fit in one */
 
-/* On-disk entry. Keep small and fixed-layout. */
+/* status codes for log_entry_t::status */
+#define LOG_STATUS_IN_FLIGHT        0u
+#define LOG_STATUS_OK               1u
+#define LOG_STATUS_MISMATCH         2u
+#define LOG_STATUS_EXPECTED_FAULT   3u  /* intentional bad-address access faulted at the target */
+#define LOG_STATUS_FAULT_MISSED     4u  /* intentional bad-address access returned without faulting */
+
+/* bits for log_entry_t::flags */
+#define LOG_FLAG_ZEROMASK           (1u << 0)
+#define LOG_FLAG_STORE_VARIANT      (1u << 1)
+#define LOG_FLAG_EXPECTING_FAULT    (1u << 2)  /* op was intentionally aimed at a bad address */
+
+/* On-disk entry. Keep small and fixed-layout. Append-only — any new field
+ * goes at the end and bumps LOG_VERSION. */
 typedef struct {
 	uint64_t iter;              /* iteration number within the thread */
 	uint64_t timestamp_ns;      /* CLOCK_MONOTONIC at dispatch */
@@ -22,10 +35,12 @@ typedef struct {
 	uint32_t mask_pattern;      /* k-register value used */
 	uint32_t alignment_offset;  /* bytes added to base pointer */
 	uint32_t zmm_dst;           /* 0..31 */
-	uint32_t flags;             /* bit 0: zero-masking; bit 1: store variant */
-	uint64_t status;            /* 0=in-flight, 1=completed, >=2=mismatch */
+	uint32_t flags;             /* see LOG_FLAG_* */
+	uint64_t status;            /* see LOG_STATUS_* */
 	uint64_t input_hash;        /* fnv1a of input bytes */
 	uint64_t output_hash;       /* fnv1a of output bytes */
+	uint64_t expected_fault_addr; /* for LOG_FLAG_EXPECTING_FAULT ops: bad pointer dispatched */
+	uint64_t actual_fault_addr; /* CR2/si_addr observed by handler; 0 if no fault */
 } log_entry_t;
 
 typedef struct {
@@ -65,6 +80,13 @@ log_entry_t *logger_begin(logger_t *lg, uint64_t iter,
                           uint32_t mask_pattern, uint32_t alignment_offset,
                           uint32_t zmm_dst, uint32_t flags,
                           uint64_t input_hash);
+
+/* Variant for intentional-fault ops: sets LOG_FLAG_EXPECTING_FAULT,
+ * records expected_fault_addr, and uses a distinct console echo. */
+log_entry_t *logger_begin_fault(logger_t *lg, uint64_t iter,
+                                uint32_t insn_class, uint32_t flags,
+                                uint64_t expected_fault_addr,
+                                uint32_t variant);
 
 /* Patch the entry with final output hash and status, then msync again. */
 void logger_end(logger_t *lg, log_entry_t *e,

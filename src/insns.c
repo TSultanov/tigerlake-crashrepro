@@ -315,6 +315,70 @@ static void exec_vplzcntq(const void *a, const void *b, void *dst,
 	}
 }
 
+/* ---------- intentional fault executors ----------
+ *
+ * Each variant issues exactly one AVX-512 load or store through a caller-
+ * supplied bad pointer and is expected to fault. noinline so RIP at the
+ * fault points into the variant the caller selected, which makes it easy
+ * to tell from a crash dump which encoding tripped. Store variants first
+ * materialize a known constant in zmm2 so register state at fault is
+ * predictable for post-mortem. */
+
+static __attribute__((noinline))
+void fault_load_u64(uintptr_t bad) {
+	__asm__ volatile("vmovdqu64 (%0), %%zmm2\n\t"
+	                 : : "r"(bad) : "zmm2", "memory");
+}
+
+static __attribute__((noinline))
+void fault_store_u64(uintptr_t bad) {
+	__asm__ volatile("vpxorq %%zmm2, %%zmm2, %%zmm2\n\t"
+	                 "vmovdqu64 %%zmm2, (%0)\n\t"
+	                 : : "r"(bad) : "zmm2", "memory");
+}
+
+static __attribute__((noinline))
+void fault_load_a64(uintptr_t bad) {
+	__asm__ volatile("vmovdqa64 (%0), %%zmm2\n\t"
+	                 : : "r"(bad) : "zmm2", "memory");
+}
+
+static __attribute__((noinline))
+void fault_store_a64(uintptr_t bad) {
+	__asm__ volatile("vpxorq %%zmm2, %%zmm2, %%zmm2\n\t"
+	                 "vmovdqa64 %%zmm2, (%0)\n\t"
+	                 : : "r"(bad) : "zmm2", "memory");
+}
+
+static __attribute__((noinline))
+void fault_load_u32(uintptr_t bad) {
+	__asm__ volatile("vmovdqu32 (%0), %%zmm2\n\t"
+	                 : : "r"(bad) : "zmm2", "memory");
+}
+
+static __attribute__((noinline))
+void fault_store_u8(uintptr_t bad) {
+	__asm__ volatile("vpxorq %%zmm2, %%zmm2, %%zmm2\n\t"
+	                 "vmovdqu8 %%zmm2, (%0)\n\t"
+	                 : : "r"(bad) : "zmm2", "memory");
+}
+
+static void exec_intentional_fault(const void *a, const void *b, void *dst,
+                                   uint64_t mask, int zeromask) {
+	(void)b; (void)dst; (void)zeromask;
+	uintptr_t bad = (uintptr_t)a;
+	uint32_t variant = (uint32_t)(mask & 0x7u);
+	switch (variant) {
+	case INSN_FAULT_VAR_LOAD_U64:  fault_load_u64(bad);  break;
+	case INSN_FAULT_VAR_STORE_U64: fault_store_u64(bad); break;
+	case INSN_FAULT_VAR_LOAD_A64:  fault_load_a64(bad);  break;
+	case INSN_FAULT_VAR_STORE_A64: fault_store_a64(bad); break;
+	case INSN_FAULT_VAR_LOAD_U32:  fault_load_u32(bad);  break;
+	case INSN_FAULT_VAR_STORE_U8:  fault_store_u8(bad);  break;
+	default:                       fault_load_u64(bad);  break;
+	}
+}
+
 /* ---------- table ---------- */
 
 /* Forward decls for oracle funcs (in insns_oracle.c). */
@@ -330,6 +394,7 @@ void oracle_vpsllvq    (const void *a, const void *b, void *dst, uint64_t m, int
 void oracle_vpmullq    (const void *a, const void *b, void *dst, uint64_t m, int z);
 void oracle_vpopcntq   (const void *a, const void *b, void *dst, uint64_t m, int z);
 void oracle_vplzcntq   (const void *a, const void *b, void *dst, uint64_t m, int z);
+void oracle_intentional_fault(const void *a, const void *b, void *dst, uint64_t m, int z);
 
 const insn_spec_t insn_specs[INSN_CLASS_COUNT] = {
 	[INSN_VMOVDQU64]     = {"vmovdqu64",     0, 0, exec_vmovdqu64,     oracle_vmovdqu64},
@@ -344,6 +409,8 @@ const insn_spec_t insn_specs[INSN_CLASS_COUNT] = {
 	[INSN_VPMULLQ]       = {"vpmullq",       0, 1, exec_vpmullq,       oracle_vpmullq},
 	[INSN_VPOPCNTQ]      = {"vpopcntq",      0, 0, exec_vpopcntq,      oracle_vpopcntq},
 	[INSN_VPLZCNTQ]      = {"vplzcntq",      0, 0, exec_vplzcntq,      oracle_vplzcntq},
+	[INSN_INTENTIONAL_FAULT] = {"intentional_fault", 0, 0,
+	                            exec_intentional_fault, oracle_intentional_fault},
 };
 
 const char *insn_name(uint32_t class_id) {

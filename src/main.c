@@ -24,6 +24,9 @@ static void usage(const char *prog) {
 		"  --classes=<csv>       restrict to these insn names; default: all\n"
 		"  --verify=<on|off>     scalar oracle compare (default: on)\n"
 		"  --churn=<on|off>      AVX-512 frequency/power churn (default: on)\n"
+		"  --faults=<on|off>     AVX-512 loads/stores at intentionally bad\n"
+		"                        addresses (SIGSEGV recovered and logged);\n"
+		"                        default: on\n"
 		"  --pin                 pin thread i to core i (default: off)\n"
 		"  --quiet               suppress periodic progress output\n"
 		"  --verbose             echo every iteration to the console\n"
@@ -110,6 +113,7 @@ int main(int argc, char **argv) {
 	uint64_t class_mask = 0;
 	int verify = 1;
 	int churn = 1;
+	int faults = 1;
 	int pin = 0;
 	int quiet = 0;
 	int verbose = 0;
@@ -131,6 +135,8 @@ int main(int argc, char **argv) {
 			verify = parse_on_off(argv[i] + 9, 1);
 		} else if (!strncmp(argv[i], "--churn=", 8)) {
 			churn = parse_on_off(argv[i] + 8, 1);
+		} else if (!strncmp(argv[i], "--faults=", 9)) {
+			faults = parse_on_off(argv[i] + 9, 1);
 		} else if (!strcmp(argv[i], "--pin")) {
 			pin = 1;
 		} else if (!strcmp(argv[i], "--quiet")) {
@@ -168,9 +174,10 @@ int main(int argc, char **argv) {
 			"the target crash.\n");
 	}
 
-	printf("seed=0x%016llx threads=%d iters=%llu verify=%s churn=%s pin=%d logdir=%s\n",
+	printf("seed=0x%016llx threads=%d iters=%llu verify=%s churn=%s faults=%s pin=%d logdir=%s\n",
 	       (unsigned long long)seed, threads, (unsigned long long)iters,
-	       verify ? "on" : "off", churn ? "on" : "off", pin, logdir);
+	       verify ? "on" : "off", churn ? "on" : "off",
+	       faults ? "on" : "off", pin, logdir);
 
 	if (sighandler_install_global(logdir) < 0) {
 		fprintf(stderr, "error: cannot install crash handlers: %s\n",
@@ -199,6 +206,7 @@ int main(int argc, char **argv) {
 		ws[i].cfg.class_mask = class_mask;
 		ws[i].cfg.verify     = verify;
 		ws[i].cfg.churn      = churn;
+		ws[i].cfg.faults     = faults;
 		ws[i].cfg.pin_core   = pin ? i : -1;
 		ws[i].cfg.quiet      = quiet;
 		ws[i].cfg.verbose    = verbose;

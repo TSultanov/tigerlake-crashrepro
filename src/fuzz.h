@@ -11,6 +11,7 @@ typedef struct {
 	uint64_t    class_mask;    /* bit i set => class i enabled; 0 => all */
 	int         verify;        /* scalar oracle compare on/off */
 	int         churn;         /* frequency/power churn on/off */
+	int         faults;        /* intentional AVX-512 bad-address faults on/off */
 	int         pin_core;      /* -1 = no pin */
 	int         quiet;
 	int         verbose;       /* per-iter console echo from the logger */

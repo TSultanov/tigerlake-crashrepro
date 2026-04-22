@@ -18,9 +18,20 @@ typedef enum {
 	INSN_VPMULLQ   = 9,
 	INSN_VPOPCNTQ  = 10,
 	INSN_VPLZCNTQ  = 11,
+	INSN_INTENTIONAL_FAULT = 12,
 
 	INSN_CLASS_COUNT
 } insn_class_t;
+
+/* Variant selector passed to the intentional-fault executor via the mask
+ * argument (low 3 bits). Covers load vs store and a few encodings. */
+#define INSN_FAULT_VAR_LOAD_U64   0u
+#define INSN_FAULT_VAR_STORE_U64  1u
+#define INSN_FAULT_VAR_LOAD_A64   2u
+#define INSN_FAULT_VAR_STORE_A64  3u
+#define INSN_FAULT_VAR_LOAD_U32   4u
+#define INSN_FAULT_VAR_STORE_U8   5u
+#define INSN_FAULT_VAR_COUNT      6u
 
 /* Unified contract for every class:
  *   a_in, b_in: 64 bytes each, aligned-or-not per the test shape.

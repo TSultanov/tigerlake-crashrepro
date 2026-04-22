@@ -3,6 +3,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <setjmp.h>
 #include <signal.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -18,6 +19,25 @@
 static __thread logger_t *tls_logger = NULL;
 static __thread int       tls_crash_fd = -1;
 static __thread char      tls_logdir[512];
+
+/* Expected-fault recovery state. See sighandler.h for the contract. */
+__thread sigjmp_buf          sighandler_recovery_buf;
+static __thread volatile int tls_expecting_fault = 0;
+static __thread uint64_t     tls_expected_addr   = 0;
+static __thread log_entry_t *tls_expected_entry  = NULL;
+
+void sighandler_arm_expected_fault(uint64_t expected_addr, log_entry_t *e) {
+	tls_expected_addr  = expected_addr;
+	tls_expected_entry = e;
+	/* Publish last so the handler never sees a stale entry pointer. */
+	tls_expecting_fault = 1;
+}
+
+void sighandler_disarm_expected_fault(void) {
+	tls_expecting_fault = 0;
+	tls_expected_entry  = NULL;
+	tls_expected_addr   = 0;
+}
 
 /* ---------- async-signal-safe writers ---------- */
 
@@ -61,6 +81,10 @@ static void safe_reg(int fd, const char *name, uint64_t v) {
 	safe_hex64(fd, v);
 	safe_str(fd, "\n");
 }
+
+/* ---------- handler install state (accessible from inside the handler) ---------- */
+
+static struct sigaction g_sa;  /* template used to reinstall after recovery */
 
 /* ---------- the handler ---------- */
 
@@ -159,6 +183,45 @@ static void dump_rip_bytes(int fd, uint64_t rip) {
 static void handler(int sig, siginfo_t *info, void *ucontext_v) {
 	int fd = tls_crash_fd >= 0 ? tls_crash_fd : STDERR_FILENO;
 
+	/* Expected-fault recovery fast-path. If the fuzz loop armed us and
+	 * the fault address matches (page-granular) what we dispatched to,
+	 * patch the log entry, reinstall the handler (SA_RESETHAND cleared
+	 * it), and siglongjmp back to the loop. */
+	if (tls_expecting_fault && (sig == SIGSEGV || sig == SIGBUS)) {
+		uint64_t actual = (uint64_t)info->si_addr;
+#if defined(__x86_64__)
+		if (ucontext_v) {
+			const ucontext_t *uc = (const ucontext_t *)ucontext_v;
+			uint64_t cr2 = (uint64_t)uc->uc_mcontext.gregs[REG_CR2];
+			if (cr2) actual = cr2;
+		}
+#endif
+		const uint64_t page_mask = ~(uint64_t)0xfff;
+		if ((actual & page_mask) == (tls_expected_addr & page_mask)) {
+			log_entry_t *e = tls_expected_entry;
+			tls_expecting_fault = 0;
+			if (e) {
+				e->actual_fault_addr = actual;
+				e->status = LOG_STATUS_EXPECTED_FAULT;
+				msync(e, sizeof *e, MS_SYNC);
+			}
+			safe_str(fd, "expected fault: sig=");
+			safe_str(fd, sig_name(sig));
+			safe_str(fd, " addr=");
+			safe_hex64(fd, actual);
+			safe_str(fd, " expected=");
+			safe_hex64(fd, tls_expected_addr);
+			safe_str(fd, "\n");
+			/* SA_RESETHAND dropped the handler; reinstall for both signals
+			 * we recover from so the next intentional fault is caught too. */
+			sigaction(SIGSEGV, &g_sa, NULL);
+			sigaction(SIGBUS,  &g_sa, NULL);
+			siglongjmp(sighandler_recovery_buf, 1);
+		}
+		/* Mismatch: fall through to normal crash dump. The ring buffer
+		 * still shows the intentional op so triage has full context. */
+	}
+
 	safe_str(fd, "\n*** crashrepro: ");
 	safe_str(fd, sig_name(sig));
 	safe_str(fd, " si_code=");
@@ -200,15 +263,14 @@ int sighandler_install_global(const char *logdir) {
 		tls_logdir[n] = '\0';
 	}
 
-	struct sigaction sa;
-	memset(&sa, 0, sizeof sa);
-	sa.sa_sigaction = handler;
-	sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESETHAND | SA_NODEFER;
-	sigemptyset(&sa.sa_mask);
+	memset(&g_sa, 0, sizeof g_sa);
+	g_sa.sa_sigaction = handler;
+	g_sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESETHAND | SA_NODEFER;
+	sigemptyset(&g_sa.sa_mask);
 
 	const int sigs[] = { SIGSEGV, SIGILL, SIGBUS, SIGFPE, SIGTRAP };
 	for (size_t i = 0; i < sizeof sigs / sizeof sigs[0]; i++) {
-		if (sigaction(sigs[i], &sa, NULL) < 0) {
+		if (sigaction(sigs[i], &g_sa, NULL) < 0) {
 			return -1;
 		}
 	}

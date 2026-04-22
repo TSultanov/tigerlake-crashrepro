@@ -143,6 +143,43 @@ log_entry_t *logger_begin(logger_t *lg, uint64_t iter,
 	return e;
 }
 
+log_entry_t *logger_begin_fault(logger_t *lg, uint64_t iter,
+                                uint32_t insn_class, uint32_t flags,
+                                uint64_t expected_fault_addr,
+                                uint32_t variant) {
+	log_file_t *lf = lg->map;
+	uint32_t pos = lf->ring_pos;
+	log_entry_t *e = &lf->entries[pos];
+	e->iter = iter;
+	e->timestamp_ns = now_ns();
+	e->insn_class = insn_class;
+	e->operand_shape = variant;          /* repurposed: selected fault-op variant */
+	e->mask_pattern = 0;
+	e->alignment_offset = 0;
+	e->zmm_dst = 2;
+	e->flags = flags | LOG_FLAG_EXPECTING_FAULT;
+	e->status = LOG_STATUS_IN_FLIGHT;
+	e->input_hash = 0;
+	e->output_hash = 0;
+	e->expected_fault_addr = expected_fault_addr;
+	e->actual_fault_addr = 0;
+	lf->iter = iter;
+	lf->ring_pos = (pos + 1) % lf->ring_len;
+	msync(e, sizeof *e, MS_SYNC);
+	msync(lf, offsetof(log_file_t, entries), MS_SYNC);
+
+	uint64_t now = e->timestamp_ns;
+	if (lg->verbose || (now - lg->last_print_ns) > 1000000000ull) {
+		fprintf(stderr,
+			"t%u iter=%llu class=%s fault-dispatch variant=%u target=0x%016llx\n",
+			lg->thread_id, (unsigned long long)iter,
+			insn_name(insn_class), variant,
+			(unsigned long long)expected_fault_addr);
+		lg->last_print_ns = now;
+	}
+	return e;
+}
+
 void logger_end(logger_t *lg, log_entry_t *e,
                 uint64_t output_hash, uint64_t status) {
 	e->output_hash = output_hash;
@@ -155,9 +192,12 @@ void logger_end(logger_t *lg, log_entry_t *e,
 
 static const char *status_str(uint64_t s) {
 	switch (s) {
-	case 0: return "IN_FLIGHT";
-	case 1: return "OK";
-	default: return "MISMATCH";
+	case LOG_STATUS_IN_FLIGHT:      return "IN_FLIGHT";
+	case LOG_STATUS_OK:             return "OK";
+	case LOG_STATUS_MISMATCH:       return "MISMATCH";
+	case LOG_STATUS_EXPECTED_FAULT: return "EXPECTED_FAULT";
+	case LOG_STATUS_FAULT_MISSED:   return "FAULT_MISSED";
+	default:                        return "UNKNOWN";
 	}
 }
 
@@ -179,6 +219,12 @@ int logger_dump(const char *path) {
 		munmap(map, LOG_FILE_SIZE);
 		return -1;
 	}
+	if (lf->version != LOG_VERSION) {
+		fprintf(stderr, "dump: %s: version=%u, this build expects %u\n",
+		        path, lf->version, LOG_VERSION);
+		munmap(map, LOG_FILE_SIZE);
+		return -1;
+	}
 
 	printf("=== %s ===\n", path);
 	printf("version=%u thread=%u seed=0x%016llx iter=%llu start_ns=%llu ring_pos=%u\n",
@@ -194,7 +240,7 @@ int logger_dump(const char *path) {
 		const log_entry_t *e = &lf->entries[idx];
 		if (e->timestamp_ns == 0) continue;
 		printf("  iter=%-8llu ts=%llu insn=%u shape=%u k=0x%08x "
-		       "off=%u zmm=%u flags=0x%x status=%s in=%016llx out=%016llx\n",
+		       "off=%u zmm=%u flags=0x%x status=%s in=%016llx out=%016llx",
 		       (unsigned long long)e->iter,
 		       (unsigned long long)e->timestamp_ns,
 		       e->insn_class, e->operand_shape, e->mask_pattern,
@@ -202,6 +248,12 @@ int logger_dump(const char *path) {
 		       status_str(e->status),
 		       (unsigned long long)e->input_hash,
 		       (unsigned long long)e->output_hash);
+		if (e->flags & LOG_FLAG_EXPECTING_FAULT) {
+			printf(" expected_addr=0x%016llx actual_addr=0x%016llx",
+			       (unsigned long long)e->expected_fault_addr,
+			       (unsigned long long)e->actual_fault_addr);
+		}
+		printf("\n");
 	}
 
 	munmap(map, LOG_FILE_SIZE);
