@@ -183,10 +183,15 @@ static void dump_rip_bytes(int fd, uint64_t rip) {
 static void handler(int sig, siginfo_t *info, void *ucontext_v) {
 	int fd = tls_crash_fd >= 0 ? tls_crash_fd : STDERR_FILENO;
 
-	/* Expected-fault recovery fast-path. If the fuzz loop armed us and
-	 * the fault address matches (page-granular) what we dispatched to,
-	 * patch the log entry, reinstall the handler (SA_RESETHAND cleared
-	 * it), and siglongjmp back to the loop. */
+	/* Expected-fault recovery fast-path. If the fuzz loop armed us, any
+	 * SIGSEGV/SIGBUS on this thread is treated as expected: we're
+	 * deliberately inside code that pokes invalid addresses with AVX-512,
+	 * and the kernel-synthesized faults don't always carry a usable
+	 * fault address (e.g. #GP from vmovdqa64 misalignment yields
+	 * si_code=SI_KERNEL with si_addr=0 and CR2=0). The actual fault
+	 * address, whatever we can recover, is still logged for triage.
+	 *
+	 * A fault outside an armed section still goes to the full dump. */
 	if (tls_expecting_fault && (sig == SIGSEGV || sig == SIGBUS)) {
 		uint64_t actual = (uint64_t)info->si_addr;
 #if defined(__x86_64__)
@@ -196,30 +201,27 @@ static void handler(int sig, siginfo_t *info, void *ucontext_v) {
 			if (cr2) actual = cr2;
 		}
 #endif
-		const uint64_t page_mask = ~(uint64_t)0xfff;
-		if ((actual & page_mask) == (tls_expected_addr & page_mask)) {
-			log_entry_t *e = tls_expected_entry;
-			tls_expecting_fault = 0;
-			if (e) {
-				e->actual_fault_addr = actual;
-				e->status = LOG_STATUS_EXPECTED_FAULT;
-				msync(e, sizeof *e, MS_SYNC);
-			}
-			safe_str(fd, "expected fault: sig=");
-			safe_str(fd, sig_name(sig));
-			safe_str(fd, " addr=");
-			safe_hex64(fd, actual);
-			safe_str(fd, " expected=");
-			safe_hex64(fd, tls_expected_addr);
-			safe_str(fd, "\n");
-			/* SA_RESETHAND dropped the handler; reinstall for both signals
-			 * we recover from so the next intentional fault is caught too. */
-			sigaction(SIGSEGV, &g_sa, NULL);
-			sigaction(SIGBUS,  &g_sa, NULL);
-			siglongjmp(sighandler_recovery_buf, 1);
+		log_entry_t *e = tls_expected_entry;
+		tls_expecting_fault = 0;
+		if (e) {
+			e->actual_fault_addr = actual;
+			e->status = LOG_STATUS_EXPECTED_FAULT;
+			msync(e, sizeof *e, MS_SYNC);
 		}
-		/* Mismatch: fall through to normal crash dump. The ring buffer
-		 * still shows the intentional op so triage has full context. */
+		safe_str(fd, "expected fault: sig=");
+		safe_str(fd, sig_name(sig));
+		safe_str(fd, " si_code=");
+		safe_u64(fd, (uint64_t)info->si_code);
+		safe_str(fd, " addr=");
+		safe_hex64(fd, actual);
+		safe_str(fd, " expected=");
+		safe_hex64(fd, tls_expected_addr);
+		safe_str(fd, "\n");
+		/* SA_RESETHAND dropped the handler; reinstall for both signals
+		 * we recover from so the next intentional fault is caught too. */
+		sigaction(SIGSEGV, &g_sa, NULL);
+		sigaction(SIGBUS,  &g_sa, NULL);
+		siglongjmp(sighandler_recovery_buf, 1);
 	}
 
 	safe_str(fd, "\n*** crashrepro: ");
