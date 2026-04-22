@@ -32,9 +32,10 @@ int sighandler_thread_init(logger_t *lg);
  *         // recovered: handler already stamped entry->status=EXPECTED_FAULT
  *     }
  *
- * The handler classifies a fault as expected only when its fault address
- * matches (page-granular) the one passed to arm. Mismatches fall through
- * to the existing crash-dump + _exit path. */
+ * The handler treats SIGSEGV/SIGBUS raised while the expected-fault window
+ * is armed as recoverable. The observed si_addr/CR2 is still logged for
+ * triage because some x86 fault paths report a synthetic address that does
+ * not match the original memory operand. */
 extern __thread sigjmp_buf sighandler_recovery_buf;
 
 void sighandler_arm_expected_fault(uint64_t expected_addr, log_entry_t *e);

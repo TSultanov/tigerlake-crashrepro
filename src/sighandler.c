@@ -18,7 +18,11 @@
  * accessed from the owning thread or via async-signal-safe loads/stores. */
 static __thread logger_t *tls_logger = NULL;
 static __thread int       tls_crash_fd = -1;
-static __thread char      tls_logdir[512];
+static __thread volatile sig_atomic_t tls_in_handler = 0;
+
+/* Process-wide handler config. Written once before worker threads start,
+ * then read by each thread during sighandler_thread_init(). */
+static char g_logdir[512];
 
 /* Expected-fault recovery state. See sighandler.h for the contract. */
 __thread sigjmp_buf          sighandler_recovery_buf;
@@ -160,8 +164,9 @@ static void dump_ring(int fd, const logger_t *lg) {
 }
 
 /* Dumping bytes at RIP can re-fault (the crash may be jumping through a
- * bad pointer). SA_RESETHAND ensures a second fault in the handler
- * terminates the process cleanly; this routine is therefore best-effort. */
+ * bad pointer). SA_NODEFER lets that nested synchronous signal re-enter
+ * the handler on the same thread, where tls_in_handler makes us fail
+ * closed with an immediate _exit. This routine is therefore best-effort. */
 static void dump_rip_bytes(int fd, uint64_t rip) {
 	if (!rip) return;
 	const uint8_t *base = (const uint8_t *)(rip - 32);
@@ -181,6 +186,11 @@ static void dump_rip_bytes(int fd, uint64_t rip) {
 }
 
 static void handler(int sig, siginfo_t *info, void *ucontext_v) {
+	if (tls_in_handler) {
+		_exit(128 + sig);
+	}
+	tls_in_handler = 1;
+
 	int fd = tls_crash_fd >= 0 ? tls_crash_fd : STDERR_FILENO;
 
 	/* Expected-fault recovery fast-path. If the fuzz loop armed us, any
@@ -217,10 +227,7 @@ static void handler(int sig, siginfo_t *info, void *ucontext_v) {
 		safe_str(fd, " expected=");
 		safe_hex64(fd, tls_expected_addr);
 		safe_str(fd, "\n");
-		/* SA_RESETHAND dropped the handler; reinstall for both signals
-		 * we recover from so the next intentional fault is caught too. */
-		sigaction(SIGSEGV, &g_sa, NULL);
-		sigaction(SIGBUS,  &g_sa, NULL);
+		tls_in_handler = 0;
 		siglongjmp(sighandler_recovery_buf, 1);
 	}
 
@@ -260,14 +267,19 @@ static void handler(int sig, siginfo_t *info, void *ucontext_v) {
 int sighandler_install_global(const char *logdir) {
 	if (logdir) {
 		size_t n = strlen(logdir);
-		if (n >= sizeof tls_logdir) n = sizeof tls_logdir - 1;
-		memcpy(tls_logdir, logdir, n);
-		tls_logdir[n] = '\0';
+		if (n >= sizeof g_logdir) n = sizeof g_logdir - 1;
+		memcpy(g_logdir, logdir, n);
+		g_logdir[n] = '\0';
+	} else {
+		g_logdir[0] = '\0';
 	}
 
 	memset(&g_sa, 0, sizeof g_sa);
 	g_sa.sa_sigaction = handler;
-	g_sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESETHAND | SA_NODEFER;
+	/* Keep synchronous faults re-entrant on the same thread so the handler
+	 * can fail closed via tls_in_handler without dropping process-wide
+	 * SIGSEGV/SIGBUS handlers for other threads. */
+	g_sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER;
 	sigemptyset(&g_sa.sa_mask);
 
 	const int sigs[] = { SIGSEGV, SIGILL, SIGBUS, SIGFPE, SIGTRAP };
@@ -296,10 +308,10 @@ int sighandler_thread_init(logger_t *lg) {
 	ss.ss_flags = 0;
 	if (sigaltstack(&ss, NULL) < 0) return -1;
 
-	if (lg && tls_logdir[0]) {
+	if (lg && g_logdir[0]) {
 		char path[1024];
 		int pos = 0;
-		for (const char *p = tls_logdir; *p && pos < (int)sizeof(path) - 40; p++)
+		for (const char *p = g_logdir; *p && pos < (int)sizeof(path) - 40; p++)
 			path[pos++] = *p;
 		const char suffix_fmt[] = "/crash.t";
 		for (size_t i = 0; i < sizeof suffix_fmt - 1; i++) path[pos++] = suffix_fmt[i];
