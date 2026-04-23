@@ -27,6 +27,8 @@
 #define LOG_FLAG_SHARED_DST         (1u << 3)
 #define LOG_FLAG_INTERRUPT_PRESSURE (1u << 4)
 #define LOG_FLAG_CHURN_ACTIVE       (1u << 5)
+#define LOG_FLAG_DIRTY_UPPER        (1u << 6)
+#define LOG_FLAG_PARTIAL_FAULT      (1u << 7)
 #define LOG_FLAG_KREG_SHIFT         8u
 #define LOG_FLAG_KREG_MASK          (7u << LOG_FLAG_KREG_SHIFT)
 #define LOG_ENCODE_KREG(kreg)       ((((uint32_t)(kreg)) & 7u) << LOG_FLAG_KREG_SHIFT)
@@ -35,6 +37,13 @@
 #define LOG_FLAG_CHURN_PROFILE_MASK  (7u << LOG_FLAG_CHURN_PROFILE_SHIFT)
 #define LOG_ENCODE_CHURN_PROFILE(profile) ((((uint32_t)(profile)) & 7u) << LOG_FLAG_CHURN_PROFILE_SHIFT)
 #define LOG_DECODE_CHURN_PROFILE(flags) ((((uint32_t)(flags)) & LOG_FLAG_CHURN_PROFILE_MASK) >> LOG_FLAG_CHURN_PROFILE_SHIFT)
+#define LOG_FLAG_TLB_NOISE          (1u << 15)
+#define LOG_FLAG_SMT_ANTAGONIST     (1u << 16)
+#define LOG_FLAG_FORK_CHURN         (1u << 17)
+#define LOG_FLAG_INTERRUPT_VARIANT_SHIFT 18u
+#define LOG_FLAG_INTERRUPT_VARIANT_MASK  (3u << LOG_FLAG_INTERRUPT_VARIANT_SHIFT)
+#define LOG_ENCODE_INTERRUPT_VARIANT(variant) ((((uint32_t)(variant)) & 3u) << LOG_FLAG_INTERRUPT_VARIANT_SHIFT)
+#define LOG_DECODE_INTERRUPT_VARIANT(flags) ((((uint32_t)(flags)) & LOG_FLAG_INTERRUPT_VARIANT_MASK) >> LOG_FLAG_INTERRUPT_VARIANT_SHIFT)
 
 /* On-disk entry. Keep small and fixed-layout. Append-only — any new field
  * goes at the end and bumps LOG_VERSION. */

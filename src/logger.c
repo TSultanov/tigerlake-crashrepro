@@ -30,6 +30,11 @@ static const char *churn_scope_name(uint32_t flags) {
 	return power_profile_name((power_profile_t)LOG_DECODE_CHURN_PROFILE(flags));
 }
 
+static const char *interrupt_scope_name(uint32_t flags) {
+	if ((flags & LOG_FLAG_INTERRUPT_PRESSURE) == 0) return "noirq";
+	return interrupt_variant_name((interrupt_variant_t)LOG_DECODE_INTERRUPT_VARIANT(flags));
+}
+
 static int mkdir_p(const char *path) {
 	/* lightweight mkdir -p: handles absolute paths with no leading . */
 	char buf[1024];
@@ -127,6 +132,8 @@ log_entry_t *logger_begin(logger_t *lg, uint64_t iter,
 	e->status = 0;                 /* in-flight */
 	e->input_hash = input_hash;
 	e->output_hash = 0;
+	e->expected_fault_addr = 0;
+	e->actual_fault_addr = 0;
 	lf->iter = iter;
 	lf->ring_pos = (pos + 1) % lf->ring_len;
 	msync(e, sizeof *e, MS_SYNC);
@@ -139,7 +146,7 @@ log_entry_t *logger_begin(logger_t *lg, uint64_t iter,
 	if (lg->verbose || (now - lg->last_print_ns) > 1000000000ull) {
 		uint32_t kreg = LOG_DECODE_KREG(flags);
 		const char *dst_scope = (flags & LOG_FLAG_SHARED_DST) ? "shared-dst" : "private-dst";
-		const char *irq_scope = (flags & LOG_FLAG_INTERRUPT_PRESSURE) ? "irq" : "noirq";
+		const char *irq_scope = interrupt_scope_name(flags);
 		fprintf(stderr,
 			"t%u iter=%llu class=%s shape=%s %s %s k=k%u mask32=%08x off=%u zmm=%u %s in=%016llx\n",
 			lg->thread_id, (unsigned long long)iter,
@@ -265,7 +272,7 @@ int logger_dump(const char *path) {
 		       e->insn_class, e->operand_shape,
 		       operand_shape_name(e->operand_shape),
 		       (e->flags & LOG_FLAG_SHARED_DST) ? "shared" : "private",
-		       (e->flags & LOG_FLAG_INTERRUPT_PRESSURE) ? "on" : "off",
+		       interrupt_scope_name(e->flags),
 		       churn_scope_name(e->flags),
 		       LOG_DECODE_KREG(e->flags), e->mask_pattern,
 		       e->alignment_offset, e->zmm_dst, e->flags,

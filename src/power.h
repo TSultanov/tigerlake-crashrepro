@@ -74,4 +74,15 @@ typedef struct {
 void power_churn_plan(prng_t *p, const power_cfg_t *cfg, power_plan_t *plan);
 void power_churn_cycle(prng_t *p, const power_plan_t *plan, power_stats_t *st);
 
+/* Keep upper vector state live across an AVX2 -> AVX-512 transition without
+ * issuing vzeroupper/vzeroall. Uses only VEX-encoded AVX2 instructions. */
+void power_dirty_upper_warmup(void);
+
+/* Lightweight AVX2 sibling workload used by SMT antagonist threads. */
+void power_avx2_antagonist_step(void);
+
+/* Short masked AVX-512 probe used from interrupt handlers to exercise
+ * XSAVE/XRSTOR around handler entry/exit with live ZMM + k-register state. */
+void power_interrupt_signal_probe(void);
+
 #endif

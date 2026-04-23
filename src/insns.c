@@ -152,6 +152,7 @@
 	} while (0)
 
 static __thread uint32_t tls_kreg = INSN_KREG_MIN;
+static __thread int tls_raw_gather_scatter_offsets = 0;
 
 void insn_set_kreg(uint32_t kreg) {
 	if (kreg < INSN_KREG_MIN || kreg > INSN_KREG_MAX) {
@@ -165,12 +166,23 @@ uint32_t insn_get_kreg(void) {
 	return tls_kreg;
 }
 
+void insn_set_raw_gather_scatter_offsets(int enabled) {
+	tls_raw_gather_scatter_offsets = enabled ? 1 : 0;
+}
+
 static inline uint32_t bounded_dword_offset(uint32_t raw) {
 	return raw & 60u;
 }
 
 static void sanitize_gather_offsets_dword(const void *a_in, int32_t *idx_out,
 	                                      uint32_t lanes) {
+	if (tls_raw_gather_scatter_offsets) {
+		const int32_t *raw = (const int32_t *)a_in;
+		for (uint32_t i = 0; i < lanes; i++) {
+			idx_out[i] = raw[i];
+		}
+		return;
+	}
 	const uint32_t *raw = (const uint32_t *)a_in;
 	for (uint32_t i = 0; i < lanes; i++) {
 		idx_out[i] = (int32_t)bounded_dword_offset(raw[i]);
@@ -179,6 +191,13 @@ static void sanitize_gather_offsets_dword(const void *a_in, int32_t *idx_out,
 
 static void sanitize_scatter_offsets_dword(const void *b_in, int32_t *idx_out,
 	                                       uint32_t lanes) {
+	if (tls_raw_gather_scatter_offsets) {
+		const int32_t *raw = (const int32_t *)b_in;
+		for (uint32_t i = 0; i < lanes; i++) {
+			idx_out[i] = raw[i];
+		}
+		return;
+	}
 	const uint32_t *raw = (const uint32_t *)b_in;
 	uint32_t slots[16];
 

@@ -4,6 +4,21 @@
 #include <stdint.h>
 #include <unistd.h>
 
+static __thread uint64_t g_interrupt_probe_src[8] __attribute__((aligned(64))) = {
+	0x1111111111111111ull, 0x2222222222222222ull,
+	0x3333333333333333ull, 0x4444444444444444ull,
+	0x5555555555555555ull, 0x6666666666666666ull,
+	0x7777777777777777ull, 0x8888888888888888ull,
+};
+
+static __thread uint64_t g_interrupt_probe_ones[8] __attribute__((aligned(64))) = {
+	1ull, 1ull, 1ull, 1ull, 1ull, 1ull, 1ull, 1ull,
+};
+
+static __thread uint64_t g_interrupt_probe_dst[8] __attribute__((aligned(64))) = {
+	0ull, 0ull, 0ull, 0ull, 0ull, 0ull, 0ull, 0ull,
+};
+
 /* One unit of burst work with no cross-register dependencies, designed to
  * keep both vector pipes busy. Operates on zmm16..zmm27 (EVEX-only
  * encoding) to also exercise the encoder path those registers go through. */
@@ -106,6 +121,63 @@ static inline void avx2_gap_kernel(void) {
 		"vpaddq %%ymm11, %%ymm10, %%ymm8\n\t"
 		::: "ymm8", "ymm9", "ymm10", "ymm11", "memory"
 	);
+}
+
+void power_dirty_upper_warmup(void) {
+	__asm__ volatile(
+		"vpxor  %%ymm0,  %%ymm0,  %%ymm0\n\t"
+		"vpxor  %%ymm1,  %%ymm1,  %%ymm1\n\t"
+		"vpxor  %%ymm2,  %%ymm2,  %%ymm2\n\t"
+		"vpxor  %%ymm3,  %%ymm3,  %%ymm3\n\t"
+		"vpxor  %%ymm4,  %%ymm4,  %%ymm4\n\t"
+		"vpxor  %%ymm5,  %%ymm5,  %%ymm5\n\t"
+		"vpxor  %%ymm6,  %%ymm6,  %%ymm6\n\t"
+		"vpxor  %%ymm7,  %%ymm7,  %%ymm7\n\t"
+		"vpaddq %%ymm0,  %%ymm1,  %%ymm8\n\t"
+		"vpaddq %%ymm2,  %%ymm3,  %%ymm9\n\t"
+		"vpxor  %%ymm4,  %%ymm5,  %%ymm10\n\t"
+		"vpxor  %%ymm6,  %%ymm7,  %%ymm11\n\t"
+		"vpsllq $1,      %%ymm8,  %%ymm12\n\t"
+		"vpsllq $2,      %%ymm9,  %%ymm13\n\t"
+		"vpor   %%ymm10, %%ymm11, %%ymm14\n\t"
+		"vpaddq %%ymm12, %%ymm14, %%ymm15\n\t"
+		::: "ymm0", "ymm1", "ymm2", "ymm3", "ymm4", "ymm5", "ymm6", "ymm7",
+		    "ymm8", "ymm9", "ymm10", "ymm11", "ymm12", "ymm13", "ymm14", "ymm15",
+		    "memory"
+	);
+}
+
+void power_avx2_antagonist_step(void) {
+	__asm__ volatile(
+		"vpxor  %%ymm8,  %%ymm8,  %%ymm8\n\t"
+		"vpxor  %%ymm9,  %%ymm9,  %%ymm9\n\t"
+		"vpaddq %%ymm8,  %%ymm9,  %%ymm10\n\t"
+		"vpsllq $1,      %%ymm10, %%ymm11\n\t"
+		"vpsubq %%ymm10, %%ymm11, %%ymm12\n\t"
+		"vpxor  %%ymm11, %%ymm12, %%ymm13\n\t"
+		"vpaddq %%ymm12, %%ymm13, %%ymm14\n\t"
+		"vpxor  %%ymm14, %%ymm10, %%ymm15\n\t"
+		::: "ymm8", "ymm9", "ymm10", "ymm11", "ymm12", "ymm13", "ymm14", "ymm15",
+		    "memory"
+	);
+}
+
+void power_interrupt_signal_probe(void) {
+	uint32_t mask = 0x5Au;
+
+	__asm__ volatile(
+		"kmovw %k3, %%k1\n\t"
+		"vmovdqu64 (%0), %%zmm0\n\t"
+		"vmovdqu64 (%1), %%zmm1\n\t"
+		"vmovdqu64 (%2), %%zmm2\n\t"
+		"vpaddq %%zmm1, %%zmm0, %%zmm2 %{%%k1%}\n\t"
+		"vmovdqu64 %%zmm2, (%2)\n\t"
+		:
+		: "r"(g_interrupt_probe_src),
+		  "r"(g_interrupt_probe_ones),
+		  "r"(g_interrupt_probe_dst),
+		  "r"(mask)
+		: "k1", "zmm0", "zmm1", "zmm2", "memory");
 }
 
 static void run_burst_window(prng_t *p, uint8_t *mem, uint64_t burst_us,

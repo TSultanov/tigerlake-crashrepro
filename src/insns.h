@@ -73,5 +73,6 @@ extern const insn_spec_t insn_specs[INSN_CLASS_COUNT];
 const char *insn_name(uint32_t class_id);
 void insn_set_kreg(uint32_t kreg);
 uint32_t insn_get_kreg(void);
+void insn_set_raw_gather_scatter_offsets(int enabled);
 
 #endif

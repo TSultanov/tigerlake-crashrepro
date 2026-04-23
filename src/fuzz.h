@@ -49,6 +49,21 @@ static inline const char *share_dst_mode_name(share_dst_mode_t mode) {
 	}
 }
 
+typedef enum {
+	INTERRUPT_VARIANT_BASIC = 0,
+	INTERRUPT_VARIANT_RT = 1,
+	INTERRUPT_VARIANT_NESTED = 2,
+} interrupt_variant_t;
+
+static inline const char *interrupt_variant_name(interrupt_variant_t variant) {
+	switch (variant) {
+	case INTERRUPT_VARIANT_BASIC:  return "basic";
+	case INTERRUPT_VARIANT_RT:     return "rt";
+	case INTERRUPT_VARIANT_NESTED: return "nested";
+	default:                       return "unknown";
+	}
+}
+
 typedef struct {
 	uint32_t    thread_id;
 	uint32_t    thread_count;
@@ -59,6 +74,12 @@ typedef struct {
 	uint32_t    shape_mask;    /* bit i set => operand shape i enabled; 0 => all */
 	share_dst_mode_t share_dst_mode;
 	int         interrupt_pressure;
+	interrupt_variant_t interrupt_variant;
+	int         dirty_upper;
+	int         gather_scatter_partial_fault;
+	int         tlb_noise;
+	int         smt_antagonist;
+	int         fork_churn;
 	power_cfg_t power;
 	int         verify;        /* scalar oracle compare on/off */
 	int         churn;         /* frequency/power churn on/off */

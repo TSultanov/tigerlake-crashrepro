@@ -1,3 +1,7 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include "fuzz.h"
 #include "insns.h"
 #include "logger.h"
@@ -16,11 +20,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #define PAGE_SIZE  4096u
 #define PLAY_SIZE  (128u * 1024u)   /* per-region play area */
 #define SHARE_DST_PHASE_ITERS (1ull << 14)
+#define FORK_CHURN_RATE_MASK 0x3FFu
+#define PARTIAL_FAULT_RATE_MASK 0x3u
 
 /* Layout for each worker's scratch: three regions (A, B, dst) each sandwiched
  * between PROT_NONE guard pages so walking off the end is a clean SIGSEGV
@@ -59,6 +66,52 @@ typedef struct {
 static shared_dst_state_t g_shared_dst = {
 	.mu = PTHREAD_MUTEX_INITIALIZER,
 };
+
+static void fork_child_probe(void) {
+	uint8_t src[64] __attribute__((aligned(64)));
+	uint8_t dst[64] __attribute__((aligned(64)));
+	for (size_t i = 0; i < sizeof src; i++) {
+		src[i] = (uint8_t)(i * 3u + 1u);
+	}
+	__asm__ volatile(
+		"vmovdqu64 (%0), %%zmm2\n\t"
+		"vmovdqu64 %%zmm2, (%1)\n\t"
+		:
+		: "r"(src), "r"(dst)
+		: "zmm2", "memory");
+	if (dst[0] == 0xffu) {
+		_exit(99);
+	}
+}
+
+static void maybe_fork_churn(const fuzz_cfg_t *cfg, uint64_t iter) {
+	pid_t child;
+	int status;
+
+	child = fork();
+	if (child < 0) {
+		if (!cfg->quiet) {
+			fprintf(stderr, "t%u iter=%llu fork failed: %s\n",
+			        cfg->thread_id, (unsigned long long)iter,
+			        strerror(errno));
+		}
+		return;
+	}
+	if (child == 0) {
+		fork_child_probe();
+		_exit(0);
+	}
+	while (waitpid(child, &status, 0) < 0) {
+		if (errno != EINTR) {
+			if (!cfg->quiet) {
+				fprintf(stderr, "t%u iter=%llu waitpid failed: %s\n",
+				        cfg->thread_id, (unsigned long long)iter,
+				        strerror(errno));
+			}
+			break;
+		}
+	}
+}
 
 void fuzz_request_stop(void) { atomic_store_explicit(&g_stop, 1, memory_order_relaxed); }
 int  fuzz_should_stop(void)  { return atomic_load_explicit(&g_stop, memory_order_relaxed); }
@@ -265,6 +318,71 @@ static uint32_t pick_kreg(prng_t *p) {
 	return INSN_KREG_MIN + (prng_u32(p) % (INSN_KREG_MAX - INSN_KREG_MIN + 1u));
 }
 
+static int partial_fault_supported(uint32_t cls, uint32_t shape_mask) {
+	if (cls != INSN_VPGATHERDD && cls != INSN_VPSCATTERDD) {
+		return 0;
+	}
+	if (shape_mask != 0 && (shape_mask & SHAPE_BIT(OPERAND_SHAPE_DISTINCT)) == 0) {
+		return 0;
+	}
+	return 1;
+}
+
+static void choose_partial_fault_layout(prng_t *p, uint32_t cls,
+	                                    const insn_spec_t *spec,
+	                                    const scratch_t *s, uint8_t *dst_base,
+	                                    operand_layout_t *layout) {
+	size_t off_a = pick_offset(p, spec, s->region_size);
+	size_t off_b = pick_offset(p, spec, s->region_size);
+	size_t off_dst = pick_offset(p, spec, s->region_size);
+
+	layout->shape = OPERAND_SHAPE_DISTINCT;
+	layout->a_ptr = s->a + off_a;
+	layout->b_ptr = s->b + off_b;
+	layout->dst_ptr = dst_base + off_dst;
+	layout->off_dst = off_dst;
+
+	if (cls == INSN_VPGATHERDD) {
+		layout->b_ptr = s->b;
+	} else {
+		layout->dst_ptr = dst_base;
+		layout->off_dst = 0;
+	}
+}
+
+static uint64_t force_partial_fault_mask(prng_t *p, uint64_t mask,
+	                                     uint32_t *bad_lane_out) {
+	uint32_t good_lane = prng_u32(p) % 16u;
+	uint32_t bad_lane = (good_lane + 1u + (prng_u32(p) % 15u)) % 16u;
+	uint64_t lane_mask = mask & 0xffffull;
+
+	lane_mask |= 1ull << good_lane;
+	lane_mask |= 1ull << bad_lane;
+	*bad_lane_out = bad_lane;
+	return (mask & ~0xffffull) | lane_mask;
+}
+
+static uint64_t install_partial_fault_indices(prng_t *p, uint32_t cls,
+	                                          operand_layout_t *layout,
+	                                          uint32_t bad_lane) {
+	int32_t idx[16] __attribute__((aligned(64)));
+	uint8_t *fault_base;
+
+	for (uint32_t i = 0; i < 16u; i++) {
+		idx[i] = (int32_t)(4u * ((i + (prng_u32(p) & 0x3u)) & 15u));
+	}
+	idx[bad_lane] = -(int32_t)(4u * (1u + (prng_u32(p) & 0x7u)));
+
+	if (cls == INSN_VPGATHERDD) {
+		memcpy(layout->a_ptr, idx, sizeof idx);
+		fault_base = layout->b_ptr;
+	} else {
+		memcpy(layout->b_ptr, idx, sizeof idx);
+		fault_base = layout->dst_ptr;
+	}
+	return (uint64_t)((uintptr_t)fault_base + (intptr_t)idx[bad_lane]);
+}
+
 static void choose_operand_layout(prng_t *p, const insn_spec_t *spec,
 	                              const scratch_t *s, uint8_t *dst_base,
 	                              uint32_t shape_mask, operand_layout_t *layout) {
@@ -393,7 +511,11 @@ int fuzz_run(const fuzz_cfg_t *cfg) {
 	logger_t lg;
 	if (logger_open(&lg, cfg->logdir, cfg->thread_id, cfg->seed) < 0) return -1;
 	lg.verbose = cfg->verbose;
-	sighandler_thread_init(&lg);
+	if (sighandler_thread_init(&lg) < 0) {
+		fprintf(stderr, "t%u: sighandler_thread_init failed\n", cfg->thread_id);
+		logger_close(&lg);
+		return -1;
+	}
 
 	if (cfg->pin_core >= 0) {
 		cpu_set_t set;
@@ -463,6 +585,8 @@ int fuzz_run(const fuzz_cfg_t *cfg) {
 	uint8_t v_dst_oracle[64] __attribute__((aligned(64)));
 
 	while (!fuzz_should_stop() && (cfg->iters == 0 || iter < cfg->iters)) {
+		insn_set_raw_gather_scatter_offsets(0);
+
 		/* Choose class, honouring the effective mask computed above. */
 		uint32_t cls;
 		do { cls = prng_u32(&p) % INSN_CLASS_COUNT; }
@@ -503,14 +627,27 @@ int fuzz_run(const fuzz_cfg_t *cfg) {
 
 		operand_layout_t layout;
 		uint32_t kreg;
+		uint32_t partial_fault_bad_lane = 0;
 		int use_shared_dst;
+		int use_partial_fault;
+		int do_fork_churn;
+		uint64_t partial_fault_addr = 0;
 		uint8_t *dst_base;
 		uint64_t mask  = pick_mask(&p);
 		int zeromask   = prng_bool(&p);
 
 		use_shared_dst = use_shared_dst_for_iter(cfg, &s, iter);
+		use_partial_fault = cfg->gather_scatter_partial_fault &&
+		                    partial_fault_supported(cls, cfg->shape_mask) &&
+		                    ((prng_u32(&p) & PARTIAL_FAULT_RATE_MASK) == 0);
+		do_fork_churn = !use_partial_fault && cfg->fork_churn &&
+		               ((prng_u32(&p) & FORK_CHURN_RATE_MASK) == 0);
 		dst_base = use_shared_dst ? s.dst_shared : s.dst_private;
-		choose_operand_layout(&p, spec, &s, dst_base, cfg->shape_mask, &layout);
+		if (use_partial_fault) {
+			choose_partial_fault_layout(&p, cls, spec, &s, dst_base, &layout);
+		} else {
+			choose_operand_layout(&p, spec, &s, dst_base, cfg->shape_mask, &layout);
+		}
 		kreg = pick_kreg(&p);
 
 		fill_rand(&p, seed_a, 64);
@@ -519,6 +656,11 @@ int fuzz_run(const fuzz_cfg_t *cfg) {
 		memcpy(layout.a_ptr,   seed_a,   64);
 		memcpy(layout.b_ptr,   seed_b,   64);
 		memcpy(layout.dst_ptr, seed_dst, 64);
+		if (use_partial_fault) {
+			mask = force_partial_fault_mask(&p, mask, &partial_fault_bad_lane);
+			partial_fault_addr = install_partial_fault_indices(&p, cls, &layout,
+			                                                  partial_fault_bad_lane);
+		}
 		memcpy(v_a,       layout.a_ptr,   64);
 		memcpy(v_b,       layout.b_ptr,   64);
 		memcpy(v_dst_pre, layout.dst_ptr, 64);
@@ -529,13 +671,47 @@ int fuzz_run(const fuzz_cfg_t *cfg) {
 		uint32_t flags = (uint32_t)(zeromask ? LOG_FLAG_ZEROMASK : 0u) |
 		                 (uint32_t)(use_shared_dst ? LOG_FLAG_SHARED_DST : 0u) |
 		                 (uint32_t)(cfg->interrupt_pressure ? LOG_FLAG_INTERRUPT_PRESSURE : 0u) |
+		                 (uint32_t)LOG_ENCODE_INTERRUPT_VARIANT(cfg->interrupt_variant) |
+		                 (uint32_t)(cfg->dirty_upper ? LOG_FLAG_DIRTY_UPPER : 0u) |
+		                 (uint32_t)(use_partial_fault ? LOG_FLAG_PARTIAL_FAULT : 0u) |
+		                 (uint32_t)(cfg->tlb_noise ? LOG_FLAG_TLB_NOISE : 0u) |
+		                 (uint32_t)(cfg->smt_antagonist ? LOG_FLAG_SMT_ANTAGONIST : 0u) |
+		                 (uint32_t)(do_fork_churn ? LOG_FLAG_FORK_CHURN : 0u) |
 		                 LOG_ENCODE_KREG(kreg);
 		log_entry_t *e = logger_begin(&lg, iter, cls, (uint32_t)layout.shape,
 		                              (uint32_t)(mask & 0xffffffffu),
 		                              (uint32_t)(layout.off_dst & 0xffffu),
 		                              /*zmm_dst*/2, flags, in_hash);
 
+		if (cfg->dirty_upper) {
+			power_dirty_upper_warmup();
+		}
 		insn_set_kreg(kreg);
+		if (use_partial_fault) {
+			if (sigsetjmp(sighandler_recovery_buf, 1) == 0) {
+				insn_set_raw_gather_scatter_offsets(1);
+				sighandler_arm_expected_fault(partial_fault_addr, e);
+				spec->exec(layout.a_ptr, layout.b_ptr, layout.dst_ptr, mask, zeromask);
+				sighandler_disarm_expected_fault();
+				insn_set_raw_gather_scatter_offsets(0);
+				memcpy(v_dst_post, layout.dst_ptr, 64);
+				logger_end(&lg, e, fnv1a64(v_dst_post, 64), LOG_STATUS_FAULT_MISSED);
+				missed_faults++;
+				if (!cfg->quiet) {
+					fprintf(stderr,
+						"t%u iter=%llu class=%s PARTIAL_FAULT_MISSED target=0x%016llx lane=%u\n",
+						cfg->thread_id, (unsigned long long)iter,
+						spec->name, (unsigned long long)partial_fault_addr,
+						partial_fault_bad_lane);
+				}
+			} else {
+				insn_set_raw_gather_scatter_offsets(0);
+				expected_faults++;
+			}
+			last_entry = e;
+			iter++;
+			goto end_of_iter;
+		}
 		spec->exec(layout.a_ptr, layout.b_ptr, layout.dst_ptr, mask, zeromask);
 		memcpy(v_dst_post, layout.dst_ptr, 64);
 		uint64_t out_hash = fnv1a64(v_dst_post, 64);
@@ -557,6 +733,9 @@ int fuzz_run(const fuzz_cfg_t *cfg) {
 		}
 		logger_end(&lg, e, out_hash, status);
 		last_entry = e;
+		if (do_fork_churn) {
+			maybe_fork_churn(cfg, iter);
+		}
 
 		iter++;
 	end_of_iter: ;

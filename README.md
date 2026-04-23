@@ -35,7 +35,9 @@ Common runs:
 
 ```
 # Smoke test, one thread, no churn, oracle-check only:
-./crashrepro --threads=1 --iters=10000 --churn=off
+./crashrepro --threads=1 --iters=10000 --churn=off \
+             --dirty-upper=off --gather-scatter-partial-fault=off \
+             --tlb-noise=off --smt-antagonist=off --fork-churn=off
 
 # Full-throttle fuzzing on the target (default):
 ./crashrepro --logdir=/var/tmp/cr
@@ -43,8 +45,15 @@ Common runs:
 # Force always-shared destination ownership instead of the default alternating mode:
 ./crashrepro --logdir=/var/tmp/cr --share-dst=on
 
+# Revert to the old baseline worker shape (no sibling reservation / mm-noise / fork churn):
+./crashrepro --logdir=/var/tmp/cr --smt-antagonist=off --tlb-noise=off \
+             --dirty-upper=off --gather-scatter-partial-fault=off --fork-churn=off
+
 # Add asynchronous signal pressure on top of the default fuzz loop:
 ./crashrepro --logdir=/var/tmp/cr --interrupts=on
+
+# Force the nested SIGUSR1 -> realtime -> masked AVX-512 signal path explicitly:
+./crashrepro --logdir=/var/tmp/cr --interrupt-variant=nested
 
 # Force one transition profile and narrow the timing windows for replay:
 ./crashrepro --logdir=/var/tmp/cr --churn-profile=avx2 \
@@ -67,7 +76,8 @@ Flags of note:
 
 - `--seed=<u64>` — base RNG seed; each thread uses `seed ^ (tid * golden)`
   so a crash can be reproduced exactly.
-- `--threads=<N>` — default: online CPU count.
+- `--threads=<N>` — default: one worker per physical core when
+   `--smt-antagonist=on` (the default), otherwise online CPU count.
 - `--iters=<N>` — per-thread iteration count; 0 (default) runs until
   SIGINT / SIGTERM.
 - `--classes=<csv>` — restrict to named classes; `--list-classes` prints
@@ -83,6 +93,29 @@ Flags of note:
 - `--interrupts=<on|off>` — send benign asynchronous signals to worker
    threads while they fuzz, forcing extra kernel save/restore pressure
    around AVX-512 execution (default: on).
+- `--interrupt-variant=<basic|rt|nested>` — choose the signal save/restore
+   path used when interrupts are enabled. `nested` (the default) delivers
+   `SIGUSR1` first, self-targets a realtime signal from inside that
+   handler, and runs a short masked AVX-512 probe in the realtime handler on
+   the worker's alt signal stack.
+- `--dirty-upper=<on|off>` — run a VEX-encoded AVX2 warmup immediately
+   before each AVX-512 dispatch, leaving upper vector state live across the
+   transition (default: on).
+- `--gather-scatter-partial-fault=<on|off>` — on a subset of
+   `vpgatherdd` / `vpscatterdd` iterations, force mixed valid and
+   guard-page-faulting lanes, recover the signal, and log it as an expected
+   partial fault instead of oracle-checking it (default: on).
+- `--tlb-noise=<on|off>` — run a helper thread that repeatedly toggles a
+   scratch page between `PROT_NONE` and `PROT_READ|PROT_WRITE`, plus
+   `MADV_DONTNEED`, to provoke TLB shootdowns while workers execute
+   AVX-512 bursts (default: on).
+- `--smt-antagonist=<on|off>` — reserve one SMT sibling per worker,
+   auto-pin the worker to one logical CPU and an AVX2-only antagonist
+   thread to the sibling, and change the default thread count to one worker
+   per sibling pair (default: on).
+- `--fork-churn=<on|off>` — occasionally `fork()` after a hot AVX-512
+   iteration and have the child run one `vmovdqu64` probe before `_exit(0)`
+   (default: on).
 - `--churn-profile=<p>` — force one power-transition profile: `random`
    (default), `passive`, `scalar`, `avx2`, or `train`.
 - `--churn-burst-us=<r>` — set the AVX-512 burst length range in
@@ -96,7 +129,9 @@ Flags of note:
    using a mix of throughput-heavy, dependency-heavy, and memory-heavy
    burst profiles, plus passive sleeps, scalar-active cool-downs, AVX2
    bridge phases, and rapid multi-burst re-entry trains (default: on).
-- `--pin` — pin thread *i* to core *i*.
+- `--pin` — pin thread *i* to core *i* when `--smt-antagonist=off`.
+   With the default antagonist mode, pinning is automatic from the sibling
+   topology map.
 - `--verbose` — echo every logged iteration to stderr (very chatty;
   without it the logger still emits a ~1/sec per-thread heartbeat so
   you can see activity live).
@@ -114,22 +149,30 @@ For each iteration, per thread:
    and `msync`s it — this is what survives a kernel panic.
 3. Runs the AVX-512 inline-asm executor against three guard-paged
    scratch regions (A, B, dst). By default, `dst` alternates between a
-   per-thread private region and one shared region used by all workers.
+   per-thread private region and one shared region used by all workers,
+   and each normal dispatch is preceded by an AVX2 dirty-upper warmup.
 4. If verification is on, re-runs the operation in a scalar oracle
    (built with `__attribute__((target("no-avx")))` so the compiler
    cannot cheat) and `memcmp`s the result — silent miscomputation
    shows up here. When multiple threads are active, verification is
    skipped on shared-dst iterations because concurrent writers would make
-   the comparison meaningless.
+   the comparison meaningless. It is also skipped on intentional-fault and
+   partial-fault gather/scatter iterations, where the interesting outcome
+   is recovery and durable logging rather than a byte-for-byte oracle.
 5. Bumps iteration counter; ~1/256 of the time, fires an AVX-512
    burst-then-gap cycle that forces a frequency/voltage transition. The
    burst profile is varied between independent ALU pressure, dependent
    chains, and unaligned `vmovdqu64`-heavy load/store traffic; the gap is
    varied between passive sleep, active scalar work, AVX2 bridge phases,
    and rapid re-entry burst trains.
-6. If `--interrupts=on`, a helper thread asynchronously signals workers to
-   force extra user-kernel-user context switches and AVX state save/restore
-   pressure while the same fuzz cases are executing.
+6. By default, helper threads also add asynchronous signal pressure,
+   TLB-shootdown noise, and AVX2-only sibling contention while the same
+   fuzz cases are executing. The default interrupt path is a nested
+   `SIGUSR1` -> realtime signal sequence that re-enters masked AVX-512 on
+   the worker's alt signal stack.
+7. A small fraction of iterations also fork a short-lived child after a
+   hot AVX-512 dispatch so the child inherits a fresh XSAVE image and runs
+   one child-side `vmovdqu64` probe.
 
 On SIGSEGV / SIGILL / SIGBUS / SIGFPE / SIGTRAP: an async-signal-safe
 handler writes signal info, full integer register file, the thread's
