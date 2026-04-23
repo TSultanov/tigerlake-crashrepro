@@ -179,6 +179,29 @@ handler writes signal info, full integer register file, the thread's
 last 64 iteration descriptors, and a best-effort 64-byte hex dump
 around RIP, to `${logdir}/crash.t<tid>.log`.
 
+## Smoke test in QEMU (no AVX-512 hardware required)
+
+For soundness checks on a developer machine that lacks AVX-512 (e.g. an
+ARM64 Mac), `make smoke` boots Ubuntu under `qemu-system-x86_64` (TCG),
+uploads the binary and Intel SDE via SSH, and runs the README smoke
+command inside. The guest first attempts native execution; if QEMU-TCG
+does not support every AVX-512 subset the fuzzer uses, it transparently
+re-runs under Intel SDE with Tiger Lake emulation (`-tgl`).
+
+```
+make smoke                     # defaults: 500 iters, 4G RAM, 30-min budget
+SMOKE_ITERS=50 make smoke      # faster, for iteration
+SDE_KIT=/path/to/sde-external-*-lin.tar.xz make smoke   # pre-supplied SDE
+KEEP_VM=1 make smoke           # leave VM running after test for debugging
+```
+
+Requires `qemu` from Homebrew (`brew install qemu`) and outbound HTTPS on
+the first run to fetch the Ubuntu Noble cloud image and SDE kit into
+`build/smoke/cache/`. Exit 0 on pass, 1 on fail, 2 on timeout/boot
+failure. This verifies the fuzzer's own correctness (oracle compare,
+signal plumbing, log format); it does **not** reproduce the Tiger Lake
+bug, which needs the real CPU.
+
 ## Repro recipe
 
 1. Smoke-test on any AVX-512 Linux host with `--churn=off --threads=1
